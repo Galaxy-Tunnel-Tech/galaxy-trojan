@@ -7,7 +7,10 @@ const DEFAULT_UUID = "";
 const DEFAULT_TROJAN_PASS = "";
 const DEFAULT_PROXY_IP = ["www.visa.com.sg";"icook.hk"];
 const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
-const DEFAULT_DOH_URL = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query",
+"https://dns.google/dns-query",
+"https://dns.quad9.net/dns-query",
+"https://dns.adguard-dns.com/dns-query"];
 const DEFAULT_WS_PATH = "galaxy-tunnel";
 
 let userID = "";

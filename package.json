@@ -1,0 +1,18 @@
+{
+  "name": "uprotocol-web",
+  "version": "1.0.0",
+  "description": "Galaxy Tunnel Admin Interface",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "echo 'No build required'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  }
+}

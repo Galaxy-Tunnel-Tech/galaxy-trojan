@@ -1,100 +1,1163 @@
 import { connect } from "cloudflare:sockets";
-const DEFAULT_WS_PATH = "trojan-ws";
-const DEFAULT_RATE_LIMIT = 60;
-const CONNECTION_TIMEOUT_MS = 30000;
-const MAX_HANDSHAKE_BYTES = 4096;
 
-class Logger {
-  constructor(requestId, clientIp) { this.requestId = requestId; this.clientIp = clientIp; }
-  log(level, event, details = {}) {
-    const entry = { timestamp: new Date().toISOString(), level, requestId: this.requestId, clientIp: this.clientIp, event, ...details };
-    (level === "ERROR" ? console.error : level === "WARN" ? console.warn : console.log)(JSON.stringify(entry));
-  }
-  info(event, details) { this.log("INFO", event, details); }
-  warn(event, details) { this.log("WARN", event, details); }
-  error(event, details) { this.log("ERROR", event, details); }
-}
+// ============================================
+// DEFAULT CONFIGURATION & ENVIRONMENT
+// ============================================
+const DEFAULT_UUID = "";
+const DEFAULT_TROJAN_PASS = "";
+const DEFAULT_PROXY_IP = ["www.visa.com.sg";"icook.hk"];
+const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
+const DEFAULT_DOH_URL = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_WS_PATH = "galaxy-tunnel";
 
-function requestId() { return crypto.randomUUID?.() || `req_${Math.random().toString(36).slice(2, 12)}`; }
-function isValidUUID(value) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim()); }
-function normalizePath(value) {
-  const path = String(value || DEFAULT_WS_PATH).trim().replace(/^\/+|\/+$/g, "");
-  return path && path.length <= 128 && !/[\s?#\\]/.test(path) ? path : DEFAULT_WS_PATH;
-}
-function headers(type = "text/html; charset=utf-8") {
-  return {
-    "Content-Type": type,
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol",
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "SAMEORIGIN",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "X-Robots-Tag": "noindex, nofollow, noarchive, nosnippet"
-  };
-}
+let userID = "";
+let trojanPassword = "";
+let proxyIP = DEFAULT_PROXY_IP;
+let githubProxyURL = DEFAULT_PROXY_URL;
+let dohURL = DEFAULT_DOH_URL;
+let dohURLs = [
+    DEFAULT_DOH_URL,
+    "https://dns.google/dns-query",
+    "https://dns.quad9.net/dns-query"
+];
+let wsPath = DEFAULT_WS_PATH;
 
-// SHA-224 is required by the Trojan protocol. This implementation hashes the UUID credential.
-function sha224Bytes(input) {
-  const K = [
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-  ];
-  const H = [0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4];
-  const bytes = input instanceof Uint8Array ? input : new TextEncoder().encode(input);
-  const bitLen = bytes.length * 8;
-  const padded = new Uint8Array(((bytes.length + 9 + 63) >> 6) << 6);
-  padded.set(bytes); padded[bytes.length] = 0x80;
-  const view = new DataView(padded.buffer);
-  view.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
-  view.setUint32(padded.length - 4, bitLen >>> 0);
-  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-  for (let offset = 0; offset < padded.length; offset += 64) {
-    const w = new Uint32Array(64);
-    for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
-    for (let i = 16; i < 64; i++) {
-      const s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >>> 3);
-      const s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >>> 10);
-      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+// ============================================
+// SHA-224 Hash Implementation for Trojan
+// ============================================
+function sha224(str) {
+    if (!str) return "";
+    function rotateRight(n, x) { return (x >>> n) | (x << (32 - n)); }
+    function choice(x, y, z) { return (x & y) ^ (~x & z); }
+    function majority(x, y, z) { return (x & y) ^ (x & z) ^ (y & z); }
+    function sigma0(x) { return rotateRight(2, x) ^ rotateRight(13, x) ^ rotateRight(22, x); }
+    function sigma1(x) { return rotateRight(6, x) ^ rotateRight(11, x) ^ rotateRight(25, x); }
+    function gamma0(x) { return rotateRight(7, x) ^ rotateRight(18, x) ^ (x >>> 3); }
+    function gamma1(x) { return rotateRight(17, x) ^ rotateRight(19, x) ^ (x >>> 10); }
+
+    const K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+
+    let H0 = 0xc1059ed8, H1 = 0x367cd507, H2 = 0x3070dd17, H3 = 0xf70e5939;
+    let H4 = 0xffc00b31, H5 = 0x68581511, H6 = 0x64f98fa7, H7 = 0xbefa4fa4;
+
+    const utf8 = new TextEncoder().encode(str.trim());
+    const l = utf8.length;
+    const bitLen = l * 8;
+    const k = (56 - ((l + 1) % 64) + 64) % 64;
+    const padded = new Uint8Array(l + 1 + k + 8);
+    padded.set(utf8);
+    padded[l] = 0x80;
+    const view = new DataView(padded.buffer);
+    view.setUint32(padded.length - 4, bitLen, false);
+
+    const W = new Uint32Array(64);
+    for (let i = 0; i < padded.length; i += 64) {
+        for (let t = 0; t < 16; t++) {
+            W[t] = view.getUint32(i + t * 4, false);
+        }
+        for (let t = 16; t < 64; t++) {
+            W[t] = (gamma1(W[t - 2]) + W[t - 7] + gamma0(W[t - 15]) + W[t - 16]) >>> 0;
+        }
+
+        let a = H0, b = H1, c = H2, d = H3, e = H4, f = H5, g = H6, h = H7;
+        for (let t = 0; t < 64; t++) {
+            const T1 = (h + sigma1(e) + choice(e, f, g) + K[t] + W[t]) >>> 0;
+            const T2 = (sigma0(a) + majority(a, b, c)) >>> 0;
+            h = g; g = f; f = e; e = (d + T1) >>> 0;
+            d = c; c = b; b = a; a = (T1 + T2) >>> 0;
+        }
+
+        H0 = (H0 + a) >>> 0; H1 = (H1 + b) >>> 0; H2 = (H2 + c) >>> 0; H3 = (H3 + d) >>> 0;
+        H4 = (H4 + e) >>> 0; H5 = (H5 + f) >>> 0; H6 = (H6 + g) >>> 0; H7 = (H7 + h) >>> 0;
     }
-    let [a,b,c,d,e,f,g,h] = H;
-    for (let i = 0; i < 64; i++) {
-      const S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
-      const ch = (e & f) ^ (~e & g);
-      const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
-      const S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const t2 = (S0 + maj) >>> 0;
-      [h,g,f,e,d,c,b,a] = [g,f,e,(d+t1)>>>0,c,b,a,(t1+t2)>>>0];
-    }
-    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0;
-    H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
-  }
-  const out = new Uint8Array(28);
-  const outView = new DataView(out.buffer);
-  H.slice(0, 7).forEach((v, i) => outView.setUint32(i * 4, v));
-  return out;
-}
-function hex(bytes) { return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join(""); }
-function concat(...parts) { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let i = 0; for (const p of parts) { out.set(p, i); i += p.length; } return out; }
-function indexOfBytes(haystack, needle, start = 0) { outer: for (let i = start; i <= haystack.length - needle.length; i++) { for (let j = 0; j < needle.length; j++) if (haystack[i+j] !== needle[j]) continue outer; return i; } return -1; }
-function equalBytes(a, b) { if (a.length !== b.length) return false; let x = 0; for (let i=0;i<a.length;i++) x |= a[i] ^ b[i]; return x === 0; }
-function privateHost(host) { const h = String(host || "").toLowerCase().replace(/^\[|\]$/g, ""); if (!h || h === "localhost" || h.endsWith(".local") || h.endsWith(".internal")) return true; const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/); if (!m) return h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:"); const [a,b] = [+m[1], +m[2]]; return a===0 || a===10 || a===127 || (a===169&&b===254) || (a===172&&b>=16&&b<=31) || (a===192&&b===168) || (a===100&&b>=64&&b<=127); }
-function parseAddress(bytes, index) {
-  const type = bytes[index++];
-  if (type === 1) { if (bytes.length < index + 4 + 2) return null; const host = [...bytes.slice(index,index+4)].join("."); index += 4; return { host, port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
-  if (type === 3) { const n = bytes[index++]; if (!n || bytes.length < index+n+2) return null; const host = new TextDecoder().decode(bytes.slice(index,index+n)); index += n; return { host, port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
-  if (type === 4) { if (bytes.length < index + 16 + 2) return null; const h = []; for (let i=0;i<16;i+=2) h.push(((bytes[index+i]<<8)|bytes[index+i+1]).toString(16)); index += 16; return { host: h.join(":"), port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
-  return null;
+
+    const out = [H0, H1, H2, H3, H4, H5, H6];
+    return out.map(n => n.toString(16).padStart(8, "0")).join("");
 }
 
+function isValidUUID(uuid) {
+    if (!uuid) return false;
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(uuid.trim());
+}
+
+// ============================================
+// Hybrid Proxy IP Pool (Local Fast Safe List)
+// ============================================
+const DEFAULT_LOCAL_PROXIES = [
+    "cdn-b100.xn--b6gac.eu.org",
+    "cdn.xn--b6gac.eu.org",
+    "bpb.yousef.isegaro.com",
+    "icook.hk",
+    "icook.tw",
+    "www.visa.com.sg"
+];
+
+let activeProxyPool = [...DEFAULT_LOCAL_PROXIES];
+
+async function getHybridProxyIP(defaultProxy, rawUrl) {
+    if (!rawUrl || rawUrl.includes("YOUR_USERNAME")) {
+        return activeProxyPool[Math.floor(Math.random() * activeProxyPool.length)] || defaultProxy;
+    }
+    try {
+        const response = await fetch(rawUrl, {
+            cf: { cacheTtl: 300, cacheEverything: true }
+        });
+        if (response.ok) {
+            const text = await response.text();
+            const fetchedIPs = text.split("\n")
+                .map(line => line.trim())
+                .filter(line => line.length > 0 && !line.startsWith("#") && /^[a-zA-Z0-9.:-]+$/.test(line) && !isPrivateOrLocalAddress(line))
+                .slice(0, 64);
+            
+            if (fetchedIPs.length > 0) {
+                activeProxyPool = Array.from(new Set([...fetchedIPs, ...DEFAULT_LOCAL_PROXIES]));
+                if (defaultProxy && !activeProxyPool.includes(defaultProxy)) {
+                    activeProxyPool.unshift(defaultProxy);
+                }
+            }
+        }
+    } catch (err) {
+        console.warn("GitHub ProxyIP Fetch Error, falling back to local pool:", err);
+    }
+    return activeProxyPool[Math.floor(Math.random() * activeProxyPool.length)] || defaultProxy;
+}
+
+// ============================================
+// Ads & Tracker Block List
+// ============================================
+const AD_DOMAIN_SUFFIXES = [
+    "doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "adservice.google.com",
+    "pagead2.googlesyndication.com",
+    "adcolony.com",
+    "appsflyer.com",
+    "unityads.unity3d.com",
+    "vungle.com",
+    "applovin.com",
+    "flurry.com",
+    "adjust.com",
+    "branch.io",
+    "admob.com",
+    "mopub.com",
+    "criteo.com",
+    "taboola.com",
+    "outbrain.com",
+    "scorecardresearch.com",
+    "quantserve.com",
+    "popads.net",
+    "inmobi.com",
+    "adroll.com",
+    "amazon-adsystem.com",
+    "adsafeprotected.com",
+    "moatads.com",
+    "openx.net",
+    "rubiconproject.com",
+    "pubmatic.com"
+];
+
+function isAdDomain(domain) {
+    if (!domain) return false;
+    const lower = domain.toLowerCase().trim();
+    if (AD_DOMAIN_SUFFIXES.some(suffix => lower === suffix || lower.endsWith("." + suffix))) {
+        return true;
+    }
+    if (/^(ad|ads|adservice|adserver|telemetry|track|tracker|analytics)\./i.test(lower)) {
+        return true;
+    }
+    return false;
+}
+
+// ============================================
+// Direct Local Bypass & Intranet Logic
+// ============================================
+const DIRECT_BYPASS_DOMAINS = [
+    "localhost",
+    "local",
+    "internal",
+    "lan",
+    "home.arpa"
+];
+
+function isPrivateOrLocalAddress(address) {
+    if (!address) return false;
+    const lower = address.toLowerCase().trim();
+    
+    if (DIRECT_BYPASS_DOMAINS.some(d => lower === d || lower.endsWith("." + d))) {
+        return true;
+    }
+
+    if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+    const match172 = lower.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+    if (match172) {
+        const secondOctet = parseInt(match172[1], 10);
+        if (secondOctet >= 16 && secondOctet <= 31) return true;
+    }
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+
+    if (lower === "::1" || lower.startsWith("fc00:") || lower.startsWith("fe80:") || lower.startsWith("fd")) {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================
+// URL Parsing Helper for Dynamic Configs
+// ============================================
+function extractDynamicConfig(url) {
+    const parsed = new URL(url);
+    const pathSegments = parsed.pathname.split("/").filter(Boolean);
+
+    let extractedUUID = null;
+    let extractedTrojanPass = null;
+    let extractedPath = null;
+    let isSubRequest = false;
+
+    // Check query params
+    const qUUID = parsed.searchParams.get("uuid") || parsed.searchParams.get("id");
+    const qTrojan = parsed.searchParams.get("trojan") || parsed.searchParams.get("pass") || parsed.searchParams.get("trojan_pass");
+    const qProxyIP = parsed.searchParams.get("proxyip") || parsed.searchParams.get("ip");
+    const qWSPath = parsed.searchParams.get("path") || parsed.searchParams.get("wspath");
+
+    if (qUUID && isValidUUID(qUUID)) {
+        extractedUUID = qUUID.trim().toLowerCase();
+    }
+    if (qTrojan) {
+        extractedTrojanPass = qTrojan.trim();
+    }
+
+    if (pathSegments[0] === "sub") {
+        isSubRequest = true;
+        if (pathSegments[1] && isValidUUID(pathSegments[1])) {
+            extractedUUID = pathSegments[1].toLowerCase();
+        }
+    } else if (isValidUUID(pathSegments[0])) {
+        extractedUUID = pathSegments[0].toLowerCase();
+        if (pathSegments[1] === "sub") {
+            isSubRequest = true;
+        } else if (pathSegments[1]) {
+            extractedPath = pathSegments.slice(1).join("/");
+        }
+    }
+
+    return {
+        uuid: extractedUUID,
+        trojanPass: extractedTrojanPass || extractedUUID,
+        proxyIP: qProxyIP ? qProxyIP.trim() : null,
+        wsPath: qWSPath ? qWSPath.trim().replace(/^\/+/, "") : (extractedPath || null),
+        isSubRequest
+    };
+}
+
+// ============================================
+// VLESS & Trojan Subscription / Config Generator
+// ============================================
+function generateAllConfigs(host, activeUUID, activeTrojanPass, activeWSPath, activeProxy) {
+    const cleanPath = (activeWSPath || DEFAULT_WS_PATH).replace(/^\/+/, "");
+    const titleHost = host.replace(/[^a-zA-Z0-9.-]/g, "");
+    
+    // Trojan password defaults to UUID if not specified separately
+    const trojanKey = activeTrojanPass || activeUUID;
+
+    // 1. VLESS Configurations
+    const vlessTls = `vless://${activeUUID}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=%2F${encodeURIComponent(cleanPath)}%3Fed%3D2048#Galaxy-VLESS-TLS%20(${titleHost})`;
+    const vlessGrpc = `vless://${activeUUID}@${host}:443?encryption=none&security=tls&sni=${host}&type=grpc&serviceName=${encodeURIComponent(cleanPath)}#Galaxy-VLESS-gRPC%20(${titleHost})`;
+    const vlessHttp = `vless://${activeUUID}@${host}:80?encryption=none&security=none&type=ws&host=${host}&path=%2F${encodeURIComponent(cleanPath)}%3Fed%3D2048#Galaxy-VLESS-HTTP%20(${titleHost})`;
+    
+    let vlessProxy = "";
+    if (activeProxy) {
+        vlessProxy = `vless://${activeUUID}@${activeProxy}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=%2F${encodeURIComponent(cleanPath)}%3Fed%3D2048#Galaxy-VLESS-ProxyIP%20(${activeProxy})`;
+    }
+
+    // 2. Trojan Configurations (Dual Compatibility with same UUID or Password)
+    const trojanTls = `trojan://${encodeURIComponent(trojanKey)}@${host}:443?security=tls&sni=${host}&type=ws&host=${host}&path=%2F${encodeURIComponent(cleanPath)}%3Fed%3D2048#Galaxy-Trojan-TLS%20(${titleHost})`;
+    const trojanGrpc = `trojan://${encodeURIComponent(trojanKey)}@${host}:443?security=tls&sni=${host}&type=grpc&serviceName=${encodeURIComponent(cleanPath)}#Galaxy-Trojan-gRPC%20(${titleHost})`;
+    
+    let trojanProxy = "";
+    if (activeProxy) {
+        trojanProxy = `trojan://${encodeURIComponent(trojanKey)}@${activeProxy}:443?security=tls&sni=${host}&type=ws&host=${host}&path=%2F${encodeURIComponent(cleanPath)}%3Fed%3D2048#Galaxy-Trojan-ProxyIP%20(${activeProxy})`;
+    }
+
+    const configs = [
+        vlessTls,
+        trojanTls,
+        vlessGrpc,
+        trojanGrpc,
+        vlessHttp
+    ];
+    if (vlessProxy) configs.push(vlessProxy);
+    if (trojanProxy) configs.push(trojanProxy);
+
+    return {
+        plainList: configs.join("\n"),
+        base64: btoa(unescape(encodeURIComponent(configs.join("\n")))),
+        links: {
+            vlessTls,
+            vlessGrpc,
+            vlessHttp,
+            vlessProxy,
+            trojanTls,
+            trojanGrpc,
+            trojanProxy
+        }
+    };
+}
+
+// ============================================
+// Worker Main Fetch Handler
+// ============================================
+var worker_default = {
+    async fetch(request, env = {}, ctx) {
+        const url = new URL(request.url);
+        const host = request.headers.get("Host") || url.host;
+
+        // 1. Resolve Environment Variables
+        const envUUID = env.UUID || env.uuid;
+        const envTrojanPass = env.TROJAN_PASS || env.trojan_pass || env.TROJAN_PASSWORD || "";
+        const envPassword = (env.PASSWORD || env.password || "").trim();
+        const maskPageEnabled = (env.MASK_PAGE !== "false" && env.MASK_PAGE !== false);
+
+        userID = envUUID && isValidUUID(envUUID) ? envUUID.trim().toLowerCase() : "";
+        trojanPassword = envTrojanPass ? envTrojanPass.trim() : (userID || "");
+        proxyIP = env.PROXYIP || env.proxyip || env.PROXY_IP || DEFAULT_PROXY_IP;
+        githubProxyURL = env.PROXY_LIST_URL || DEFAULT_PROXY_URL;
+        dohURL = env.DNS_RESOLVER_URL || DEFAULT_DOH_URL;
+        dohURLs = String(env.DNS_RESOLVERS || "").split(",").map(v => v.trim()).filter(Boolean);
+        if (!dohURLs.length) dohURLs = [dohURL, "https://dns.google/dns-query", "https://dns.quad9.net/dns-query"];
+        wsPath = (env.WS_PATH || DEFAULT_WS_PATH).replace(/^\/+/, "");
+
+        // 2. Dynamic Runtime Config extraction from Request
+        const dynConfig = extractDynamicConfig(request.url);
+        const runtimeUUID = dynConfig.uuid || userID;
+        const runtimeTrojanPass = dynConfig.trojanPass || trojanPassword || runtimeUUID;
+        const runtimeWSPath = dynConfig.wsPath || wsPath;
+        const runtimeProxyIP = dynConfig.proxyIP || proxyIP;
+
+        // Build list of valid UUIDs & Trojan Passwords/Hashes
+        const allowedUUIDList = Array.from(
+            new Set([
+                ...(userID && isValidUUID(userID) ? [userID] : []),
+                ...(dynConfig.uuid && isValidUUID(dynConfig.uuid) ? [dynConfig.uuid] : []),
+                ...(envUUID && envUUID.includes(",") ? envUUID.split(",").map(u => u.trim().toLowerCase()).filter(isValidUUID) : [])
+            ])
+        ).filter(Boolean);
+
+        // Pre-compute Trojan SHA224 hashes for all allowed credentials (including UUIDs)
+        const allowedTrojanPassList = Array.from(
+            new Set([
+                ...(runtimeTrojanPass ? [runtimeTrojanPass] : []),
+                ...(trojanPassword ? [trojanPassword] : []),
+                ...allowedUUIDList,
+                ...(envPassword ? [envPassword] : [])
+            ])
+        ).filter(Boolean);
+
+        const allowedTrojanHashes = allowedTrojanPassList.map(p => sha224(p).toLowerCase()).filter(Boolean);
+
+        // 3. WebSocket proxy request (VLESS + Trojan over WebSocket)
+        const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
+        const requestedPath = url.pathname.replace(/^\/+|\/+$/g, "");
+        if (upgradeHeader === "websocket") {
+            if (requestedPath !== runtimeWSPath) return new Response("Not found", { status: 404 });
+            return await proxyOverWSHandler(request, allowedUUIDList, allowedTrojanHashes, runtimeWSPath);
+        }
+
+        // 4. gRPC HTTP/2 Stream proxy request (VLESS + Trojan over gRPC)
+        const contentType = request.headers.get("Content-Type") || request.headers.get("content-type") || "";
+        if (contentType.includes("application/grpc")) {
+            return await proxyOverGRPCHandler(request, allowedUUIDList, allowedTrojanHashes);
+        }
+
+        // 5. Auth Verification for Dashboard
+        const cookieHeader = request.headers.get("Cookie") || "";
+        const hasAuthCookie = cookieHeader.includes("galaxy_auth=1") || (envPassword && cookieHeader.includes(`galaxy_pwd=${encodeURIComponent(envPassword)}`));
+        const qPwd = url.searchParams.get("pwd") || url.searchParams.get("password") || url.searchParams.get("key");
+        const isAuthorizedByPwd = (envPassword && qPwd === envPassword) || (userID && qPwd === userID) || (runtimeTrojanPass && qPwd === runtimeTrojanPass);
+        const isAuthorizedByUuid = (dynConfig.uuid && isValidUUID(dynConfig.uuid));
+        const pathSegments = url.pathname.split("/").filter(Boolean);
+        const isDirectUuidPath = (pathSegments[0] && isValidUUID(pathSegments[0]));
+
+        // Login API endpoint
+        if (url.pathname === "/api/login" && request.method === "POST") {
+            try {
+                const body = await request.json().catch(() => ({}));
+                const submittedKey = (body.key || body.password || body.uuid || "").trim();
+                const isValidKey = (envPassword && submittedKey === envPassword) || 
+                                   (userID && submittedKey.toLowerCase() === userID.toLowerCase()) || 
+                                   (trojanPassword && submittedKey === trojanPassword) ||
+                                   isValidUUID(submittedKey);
+
+                if (isValidKey) {
+                    return new Response(JSON.stringify({ success: true, redirect: isValidUUID(submittedKey) ? `/${submittedKey}` : `/?pwd=${encodeURIComponent(submittedKey)}` }), {
+                        status: 200,
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Set-Cookie": "galaxy_auth=1; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly"
+                        }
+                    });
+                }
+                return new Response(JSON.stringify({ success: false, message: "Invalid UUID or Password" }), {
+                    status: 401,
+                    headers: { "Content-Type": "application/json" }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ success: false, message: "Login error" }), { status: 400 });
+            }
+        }
+
+        // Logout API endpoint
+        if (url.pathname === "/api/logout") {
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    "Location": "/",
+                    "Set-Cookie": "galaxy_auth=0; Path=/; Max-Age=0; SameSite=Lax"
+                }
+            });
+        }
+
+        // 6. Subscription Link Endpoint (/sub or /<UUID>/sub or ?sub=1)
+        if (dynConfig.isSubRequest || url.pathname === "/sub" || url.searchParams.has("sub")) {
+            const subData = generateAllConfigs(host, runtimeUUID, runtimeTrojanPass, runtimeWSPath, runtimeProxyIP);
+            
+            const acceptHeader = request.headers.get("Accept") || "";
+            if (acceptHeader.includes("text/html") && !url.searchParams.has("raw")) {
+                if (isDirectUuidPath || isAuthorizedByUuid || isAuthorizedByPwd || hasAuthCookie || !maskPageEnabled) {
+                    return new Response(getGalaxyPage(host, runtimeUUID, runtimeTrojanPass, runtimeWSPath, runtimeProxyIP, subData), {
+                        status: 200,
+                        headers: { "Content-Type": "text/html; charset=utf-8" }
+                    });
+                }
+            }
+
+            // Raw Base64 for V2Ray / Shadowrocket / Sing-Box / Clash subscriptions
+            return new Response(subData.base64, {
+                status: 200,
+                headers: {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Subscription-Userinfo": "upload=0; download=0; total=1073741824000; expire=0",
+                    "Profile-Update-Interval": "24",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            });
+        }
+
+        // 7. API Health & Edge Status Endpoint
+        if (url.pathname === "/api/health" || url.pathname === "/api/ping") {
+            return new Response(JSON.stringify({
+                status: "healthy",
+                protocols: ["VLESS", "Trojan"],
+                edge: "Cloudflare Anycast",
+                colo: request.cf?.colo || "EDGE",
+                country: request.cf?.country || "US",
+                clientIp: request.headers.get("CF-Connecting-IP") || "127.0.0.1",
+                timestamp: Date.now()
+            }), {
+                status: 200,
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+            });
+        }
+
+        // 8. Decide whether to render Camouflage Mask Page or Galaxy Dashboard
+        const isAuthorizedToViewDashboard = !maskPageEnabled || isDirectUuidPath || isAuthorizedByUuid || isAuthorizedByPwd || hasAuthCookie;
+
+        if (isAuthorizedToViewDashboard) {
+            const subData = generateAllConfigs(host, runtimeUUID, runtimeTrojanPass, runtimeWSPath, runtimeProxyIP);
+            return new Response(getGalaxyPage(host, runtimeUUID, runtimeTrojanPass, runtimeWSPath, runtimeProxyIP, subData), {
+                status: 200,
+                headers: {
+                    "Content-Type": "text/html; charset=utf-8",
+                    ...(qPwd || isAuthorizedByUuid ? { "Set-Cookie": "galaxy_auth=1; Path=/; Max-Age=86400; SameSite=Lax" } : {})
+                }
+            });
+        }
+
+        // 9. Default Public Visitors / ISPs -> Render Camouflage Mask Website
+        const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+        const colo = request.cf?.colo || "EDGE-GLOBAL";
+        return new Response(getMaskPage(host, Boolean(envPassword || userID), clientIp, colo), {
+            status: 200,
+            headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+    }
+};
+
+// ============================================
+// Dual Protocol Header Parser (VLESS & Trojan)
+// ============================================
+function processProxyHeader(buffer, allowedUUIDs, allowedTrojanHashes) {
+    if (!buffer || buffer.byteLength < 24) {
+        return { hasError: true, message: "Invalid payload data (too short)" };
+    }
+
+    const uint8 = new Uint8Array(buffer);
+
+    // ----------------------------------------------------
+    // CHECK 1: Trojan Protocol
+    // Trojan client sends: 56 hex bytes (sha224) + \r\n (0x0D, 0x0A) + CMD (1 byte) + ADDR TYPE + ...
+    // ----------------------------------------------------
+    if (uint8.byteLength >= 58 && uint8[56] === 0x0D && uint8[57] === 0x0A) {
+        const hexHash = new TextDecoder().decode(uint8.slice(0, 56)).toLowerCase().trim();
+        const isValidTrojan = allowedTrojanHashes.some(h => h && h === hexHash);
+
+        if (!isValidTrojan) {
+            return { hasError: true, message: `Invalid Trojan credential hash` };
+        }
+
+        const command = uint8[58];
+        let isUDP = false;
+        if (command === 1) {
+            isUDP = false; // TCP Connect
+        } else if (command === 3) {
+            isUDP = true;  // UDP Associate
+        } else {
+            return { hasError: true, message: `Trojan command ${command} not supported` };
+        }
+
+        if (uint8.byteLength < 60) return { hasError: true, message: "Truncated Trojan address header" };
+        const addressType = uint8[59];
+        let addressLength = 0;
+        let addressValueIndex = 60;
+        let addressValue = "";
+
+        switch (addressType) {
+            case 1: // IPv4
+                addressLength = 4;
+                addressValue = new Uint8Array(uint8.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+                break;
+            case 3: // Domain
+                if (uint8.byteLength < addressValueIndex + 1) return { hasError: true, message: "Truncated Trojan domain length" };
+                addressLength = uint8[addressValueIndex];
+                addressValueIndex += 1;
+                if (uint8.byteLength < addressValueIndex + addressLength + 4) return { hasError: true, message: "Truncated Trojan domain" };
+                addressValue = new TextDecoder().decode(uint8.slice(addressValueIndex, addressValueIndex + addressLength));
+                break;
+            case 4: // IPv6
+                addressLength = 16;
+                const dataView = new DataView(uint8.buffer, uint8.byteOffset + addressValueIndex, addressLength);
+                const ipv6 = [];
+                for (let i = 0; i < 8; i++) {
+                    ipv6.push(dataView.getUint16(i * 2).toString(16));
+                }
+                addressValue = ipv6.join(":");
+                break;
+            default:
+                return { hasError: true, message: `Invalid Trojan address type ${addressType}` };
+        }
+
+        const portIndex = addressValueIndex + addressLength;
+        if (uint8.byteLength < portIndex + 4) return { hasError: true, message: "Truncated Trojan port" };
+        const portRemote = new DataView(uint8.buffer, uint8.byteOffset + portIndex, 2).getUint16(0);
+        if (uint8[portIndex + 2] !== 0x0d || uint8[portIndex + 3] !== 0x0a) return { hasError: true, message: "Invalid Trojan final CRLF" };
+        const rawDataIndex = portIndex + 4;
+
+        return {
+            hasError: false,
+            protocol: "trojan",
+            addressRemote: addressValue,
+            addressType,
+            portRemote,
+            rawDataIndex,
+            responseHeader: null, // Trojan has no response header on TCP handshake
+            isUDP
+        };
+    }
+
+    // ----------------------------------------------------
+    // CHECK 2: VLESS Protocol
+    // ----------------------------------------------------
+    const version = uint8[0];
+    const slicedBuffer = uint8.slice(1, 17);
+    const slicedBufferString = unsafeStringify(slicedBuffer);
+
+    const validList = Array.isArray(allowedUUIDs) ? allowedUUIDs : [allowedUUIDs];
+    const isValidUser = validList.some((userUuid) => userUuid && slicedBufferString === userUuid.trim().toLowerCase());
+
+    if (!isValidUser) {
+        return { hasError: true, message: `Invalid VLESS user (${slicedBufferString})` };
+    }
+
+    const optLength = uint8[17];
+    const command = uint8[18 + optLength];
+
+    let isUDP = false;
+    if (command === 1) {
+        isUDP = false;
+    } else if (command === 2) {
+        isUDP = true;
+    } else {
+        return { hasError: true, message: `VLESS command ${command} not supported` };
+    }
+
+    const portIndex = 18 + optLength + 1;
+    const portRemote = new DataView(uint8.buffer, uint8.byteOffset + portIndex, 2).getUint16(0);
+
+    let addressIndex = portIndex + 2;
+    const addressType = uint8[addressIndex];
+
+    let addressLength = 0;
+    let addressValueIndex = addressIndex + 1;
+    let addressValue = "";
+
+    switch (addressType) {
+        case 1:
+            addressLength = 4;
+            addressValue = new Uint8Array(uint8.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+            break;
+        case 2:
+            addressLength = uint8[addressValueIndex];
+            addressValueIndex += 1;
+            addressValue = new TextDecoder().decode(uint8.slice(addressValueIndex, addressValueIndex + addressLength));
+            break;
+        case 3:
+            addressLength = 16;
+            const dataView = new DataView(uint8.buffer, uint8.byteOffset + addressValueIndex, addressLength);
+            const ipv6 = [];
+            for (let i = 0; i < 8; i++) {
+                ipv6.push(dataView.getUint16(i * 2).toString(16));
+            }
+            addressValue = ipv6.join(":");
+            break;
+        default:
+            return { hasError: true, message: `Invalid VLESS address type ${addressType}` };
+    }
+
+    if (!addressValue) {
+        return { hasError: true, message: "VLESS address value is empty" };
+    }
+
+    const responseHeader = new Uint8Array([version, 0]);
+    return {
+        hasError: false,
+        protocol: "vless",
+        addressRemote: addressValue,
+        addressType,
+        portRemote,
+        rawDataIndex: addressValueIndex + addressLength,
+        responseHeader,
+        isUDP
+    };
+}
+
+// ============================================
+// gRPC HTTP/2 Stream Proxy Handler
+// ============================================
+function makeGrpcFrame(data) {
+    const rawBytes = data instanceof Uint8Array 
+        ? data 
+        : (data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data));
+    const len = rawBytes.byteLength;
+    const frame = new Uint8Array(5 + len);
+    frame[0] = 0;
+    frame[1] = (len >> 24) & 255;
+    frame[2] = (len >> 16) & 255;
+    frame[3] = (len >> 8) & 255;
+    frame[4] = len & 255;
+    frame.set(rawBytes, 5);
+    return frame;
+}
+
+async function proxyOverGRPCHandler(request, allowedUUIDs, allowedTrojanHashes) {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+
+    let address = "";
+    let portWithRandomLog = "";
+
+    const log = (info, event) => {
+        console.log(`[gRPC][${address}:${portWithRandomLog}] ${info}`, event || "");
+    };
+
+    let remoteSocketWrapper = { value: null };
+    let udpStreamWrite = null;
+    let isDns = false;
+    let accumulatedBuffer = new Uint8Array(0);
+
+    const grpcClient = {
+        isGrpc: true,
+        send: async (data) => {
+            try {
+                const framed = makeGrpcFrame(data);
+                await writer.write(framed);
+            } catch (err) {
+                log("gRPC send error", err);
+            }
+        },
+        close: async () => {
+            try {
+                await writer.close();
+            } catch (err) {}
+        }
+    };
+
+    (async () => {
+        const reader = request.body.getReader();
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    log("gRPC body stream finished");
+                    break;
+                }
+                if (!value || value.byteLength === 0) continue;
+
+                if (isDns && udpStreamWrite) {
+                    await udpStreamWrite(value);
+                    continue;
+                }
+
+                if (remoteSocketWrapper.value) {
+                    const tcpWriter = remoteSocketWrapper.value.writable.getWriter();
+                    await tcpWriter.write(value);
+                    tcpWriter.releaseLock();
+                    continue;
+                }
+
+                const combined = new Uint8Array(accumulatedBuffer.length + value.length);
+                combined.set(accumulatedBuffer, 0);
+                combined.set(value, accumulatedBuffer.length);
+                accumulatedBuffer = combined;
+
+                let payload = null;
+                if (accumulatedBuffer.length >= 5 && accumulatedBuffer[0] === 0) {
+                    const msgLen = (accumulatedBuffer[1] << 24) | (accumulatedBuffer[2] << 16) | (accumulatedBuffer[3] << 8) | accumulatedBuffer[4];
+                    if (accumulatedBuffer.length >= 5 + msgLen) {
+                        payload = accumulatedBuffer.slice(5, 5 + msgLen);
+                        accumulatedBuffer = accumulatedBuffer.slice(5 + msgLen);
+                    }
+                } else if (accumulatedBuffer.length >= 24) {
+                    payload = accumulatedBuffer;
+                    accumulatedBuffer = new Uint8Array(0);
+                }
+
+                if (!payload || payload.length < 24) {
+                    continue;
+                }
+
+                const result = processProxyHeader(payload, allowedUUIDs, allowedTrojanHashes);
+                if (result.hasError) {
+                    throw new Error(result.message);
+                }
+
+                const {
+                    addressRemote = "",
+                    portRemote = 443,
+                    rawDataIndex,
+                    responseHeader,
+                    isUDP,
+                    protocol
+                } = result;
+
+                address = addressRemote;
+                portWithRandomLog = `${portRemote} ${isUDP ? "udp" : "tcp"} (${protocol})`;
+
+                if (isUDP && portRemote !== 53) {
+                    throw new Error("UDP proxy only enabled for DNS (port 53)");
+                }
+                if (isUDP && portRemote === 53) {
+                    isDns = true;
+                }
+
+                const rawClientData = payload.slice(rawDataIndex);
+
+                if (isDns) {
+                    const { write } = await handleUDPOutBound(grpcClient, responseHeader, log);
+                    udpStreamWrite = write;
+                    if (rawClientData.length > 0) {
+                        await udpStreamWrite(rawClientData);
+                    }
+                    continue;
+                }
+
+                handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, grpcClient, responseHeader, log);
+            }
+        } catch (err) {
+            log("gRPC processing error", err);
+        } finally {
+            safeCloseClient(grpcClient);
+        }
+    })();
+
+    return new Response(readable, {
+        status: 200,
+        headers: {
+            "Content-Type": "application/grpc",
+            "Trailer": "grpc-status, grpc-message"
+        }
+    });
+}
+
+// ============================================
+// WebSocket Proxy Handler
+// ============================================
+async function proxyOverWSHandler(request, allowedUUIDs, allowedTrojanHashes, expectedPath = DEFAULT_WS_PATH) {
+    const requestPath = new URL(request.url).pathname.replace(/^\/+|\/+$/g, "");
+    if (requestPath !== expectedPath) return new Response("Not found", { status: 404 });
+    const webSocketPair = new WebSocketPair();
+    const [client, webSocket] = Object.values(webSocketPair);
+    webSocket.accept();
+
+    let address = "";
+    let portWithRandomLog = "";
+
+    const log = (info, event) => {
+        console.log(`[WS][${address}:${portWithRandomLog}] ${info}`, event || "");
+    };
+
+    const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+
+    let remoteSocketWrapper = { value: null };
+    let udpStreamWrite = null;
+    let isDns = false;
+    let headerBuffer = new Uint8Array(0);
+    let headerParsed = false;
+
+    readableWebSocketStream.pipeTo(new WritableStream({
+        async write(chunk, controller) {
+            const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            if (isDns && udpStreamWrite) {
+                return udpStreamWrite(chunk);
+            }
+            if (remoteSocketWrapper.value || headerParsed) {
+                const writer = remoteSocketWrapper.value?.writable?.getWriter();
+                if (writer) { await writer.write(incoming); writer.releaseLock(); }
+                return;
+            }
+
+            const merged = new Uint8Array(headerBuffer.length + incoming.length);
+            merged.set(headerBuffer, 0); merged.set(incoming, headerBuffer.length);
+            headerBuffer = merged;
+            if (headerBuffer[0] !== 0 && headerBuffer.length < 58) return;
+            if (headerBuffer[0] === 0 && headerBuffer.length < 24) return;
+            if (headerBuffer.length >= 58 && headerBuffer[56] === 0x0d && headerBuffer[57] === 0x0a && headerBuffer.length < 64) return;
+            let result = processProxyHeader(headerBuffer, allowedUUIDs, allowedTrojanHashes);
+
+            if (result.hasError) {
+                throw new Error(result.message);
+            }
+
+            const {
+                addressRemote = "",
+                portRemote = 443,
+                rawDataIndex,
+                responseHeader,
+                isUDP,
+                protocol
+            } = result;
+
+            address = addressRemote;
+            portWithRandomLog = `${portRemote} ${isUDP ? "udp" : "tcp"} (${protocol})`;
+
+            if (isUDP && portRemote !== 53) {
+                throw new Error("UDP proxy only enabled for DNS (port 53)");
+            }
+            if (isUDP && portRemote === 53) {
+                isDns = true;
+            }
+
+            headerParsed = true;
+            const rawClientData = headerBuffer.slice(rawDataIndex);
+            headerBuffer = new Uint8Array(0);
+
+            if (isDns) {
+                const { write } = await handleUDPOutBound(webSocket, responseHeader, log);
+                udpStreamWrite = write;
+                udpStreamWrite(rawClientData);
+                return;
+            }
+
+            handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, responseHeader, log);
+        },
+        close() {
+            log("WebSocket stream closed");
+        },
+        abort(reason) {
+            log("WebSocket stream aborted", JSON.stringify(reason));
+        }
+    })).catch((err) => {
+        log("WebSocket pipeTo error", err);
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
+}
+
+// ============================================
+// TCP Outbound with AdBlock & Direct Bypass
+// ============================================
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, client, responseHeader, log) {
+    if (isAdDomain(addressRemote)) {
+        log(`[AdBlock] Blocked outbound connection to ad domain: ${addressRemote}`);
+        safeCloseClient(client);
+        return;
+    }
+
+    const isDirect = isPrivateOrLocalAddress(addressRemote);
+    if (isDirect) {
+        log(`[DirectBypass] Local/private route detected for ${addressRemote}:${portRemote}.`);
+    }
+
+    async function connectAndWrite(address, port) {
+        const tcpSocket2 = connect({ hostname: address, port });
+        remoteSocket.value = tcpSocket2;
+        log(`Connected to ${address}:${port}`);
+        const writer = tcpSocket2.writable.getWriter();
+        await writer.write(rawClientData);
+        writer.releaseLock();
+        return tcpSocket2;
+    }
+
+    async function retry() {
+        if (isDirect) {
+            log(`[DirectBypass] Target connection failed, direct route will not fallback to external proxy.`);
+            safeCloseClient(client);
+            return;
+        }
+
+        const activeProxy = await getHybridProxyIP(proxyIP, githubProxyURL);
+        const target = activeProxy || addressRemote;
+        log(`Retrying connection via Hybrid ProxyIP: ${target}`);
+        
+        try {
+            const tcpSocket2 = await connectAndWrite(target, portRemote);
+            tcpSocket2.closed.catch((error) => {
+                console.log("Retry tcpSocket closed error", error);
+            }).finally(() => {
+                safeCloseClient(client);
+            });
+            remoteSocketToClient(tcpSocket2, client, responseHeader, null, log);
+        } catch (err) {
+            log("Retry connect error", err);
+            safeCloseClient(client);
+        }
+    }
+
+    try {
+        const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+        remoteSocketToClient(tcpSocket, client, responseHeader, isDirect ? null : retry, log);
+    } catch (err) {
+        log("Initial TCP connect error", err);
+        if (!isDirect) {
+            await retry();
+        } else {
+            safeCloseClient(client);
+        }
+    }
+}
+
+function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
+    return new ReadableStream({
+        start(controller) {
+            webSocketServer.addEventListener("message", (event) => {
+                controller.enqueue(event.data);
+            });
+            webSocketServer.addEventListener("close", () => {
+                safeCloseWebSocket(webSocketServer);
+                controller.close();
+            });
+            webSocketServer.addEventListener("error", (err) => {
+                log("WebSocket error");
+                controller.error(err);
+            });
+
+            const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+            if (error) {
+                controller.error(error);
+            } else if (earlyData) {
+                controller.enqueue(earlyData);
+            }
+        },
+        cancel(reason) {
+            log(`ReadableStream canceled: ${reason}`);
+            safeCloseWebSocket(webSocketServer);
+        }
+    });
+}
+
+async function remoteSocketToClient(remoteSocket, client, responseHeader, retry, log) {
+    let header = responseHeader;
+    let hasIncomingData = false;
+
+    await remoteSocket.readable.pipeTo(new WritableStream({
+        async write(chunk, controller) {
+            hasIncomingData = true;
+            if (client.isGrpc) {
+                if (header) {
+                    const combined = new Uint8Array(header.length + chunk.byteLength);
+                    combined.set(header, 0);
+                    combined.set(new Uint8Array(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength), header.length);
+                    await client.send(combined);
+                    header = null;
+                } else {
+                    await client.send(chunk);
+                }
+            } else {
+                if (client.readyState !== 1) {
+                    controller.error("WebSocket not open");
+                }
+                if (header) {
+                    client.send(await new Blob([header, chunk]).arrayBuffer());
+                    header = null;
+                } else {
+                    client.send(chunk);
+                }
+            }
+        },
+        close() {
+            log(`Remote connection closed (had data: ${hasIncomingData})`);
+        },
+        abort(reason) {
+            console.error("Remote readable abort", reason);
+        }
+    })).catch((error) => {
+        console.error("remoteSocketToClient error", error.stack || error);
+        safeCloseClient(client);
+    });
+
+    if (hasIncomingData === false && retry) {
+        log("Retrying connection...");
+        retry();
+    }
+}
+
+function base64ToArrayBuffer(base64Str) {
+    if (!base64Str) {
+        return { earlyData: null, error: null };
+    }
+    try {
+        base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
+        const decode = atob(base64Str);
+        const arrayBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+        return { earlyData: arrayBuffer.buffer, error: null };
+    } catch (error) {
+        return { earlyData: null, error };
+    }
+}
+
+var byteToHex = [];
+for (let i = 0; i < 256; ++i) {
+    byteToHex.push((i + 256).toString(16).slice(1));
+}
+
+function unsafeStringify(arr, offset = 0) {
+    return (
+        byteToHex[arr[offset + 0]] +
+        byteToHex[arr[offset + 1]] +
+        byteToHex[arr[offset + 2]] +
+        byteToHex[arr[offset + 3]] +
+        "-" +
+        byteToHex[arr[offset + 4]] +
+        byteToHex[arr[offset + 5]] +
+        "-" +
+        byteToHex[arr[offset + 6]] +
+        byteToHex[arr[offset + 7]] +
+        "-" +
+        byteToHex[arr[offset + 8]] +
+        byteToHex[arr[offset + 9]] +
+        "-" +
+        byteToHex[arr[offset + 10]] +
+        byteToHex[arr[offset + 11]] +
+        byteToHex[arr[offset + 12]] +
+        byteToHex[arr[offset + 13]] +
+        byteToHex[arr[offset + 14]] +
+        byteToHex[arr[offset + 15]]
+    ).toLowerCase();
+}
+
+function safeCloseWebSocket(socket) {
+    try {
+        if (socket.readyState === 1 || socket.readyState === 2) {
+            socket.close();
+        }
+    } catch (error) {
+        console.error("safeCloseWebSocket error", error);
+    }
+}
+
+function safeCloseClient(client) {
+    if (!client) return;
+    try {
+        if (client.isGrpc && client.close) {
+            client.close();
+        } else if (client.readyState === 1 || client.readyState === 2) {
+            client.close();
+        }
+    } catch (error) {
+        console.error("safeCloseClient error", error);
+    }
+}
+
+async function handleUDPOutBound(client, responseHeader, log) {
+    let isHeaderSent = false;
+    const transformStream = new TransformStream({
+        transform(chunk, controller) {
+            for (let index = 0; index < chunk.byteLength; ) {
+                const lengthBuffer = chunk.slice(index, index + 2);
+                const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+                const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
+                index = index + 2 + udpPacketLength;
+                controller.enqueue(udpData);
+            }
+        },
+        flush(controller) {}
+    });
+
+    transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            let dnsQueryResult = null;
+            let resolverError = null;
+            for (const resolver of dohURLs) {
+                try {
+                    const resp = await fetch(resolver, {
+                        method: "POST",
+                        headers: { "content-type": "application/dns-message" },
+                        body: chunk
+                    });
+                    if (resp.ok) { dnsQueryResult = await resp.arrayBuffer(); break; }
+                    resolverError = new Error(`DoH ${resp.status}`);
+                } catch (e) { resolverError = e; }
+            }
+            if (!dnsQueryResult) throw resolverError || new Error("All DoH resolvers failed");
+            const udpSize = dnsQueryResult.byteLength;
+            const udpSizeBuffer = new Uint8Array([udpSize >> 8 & 255, udpSize & 255]);
+
+            log(`DoH success, DNS message length: ${udpSize}`);
+            const fullPacket = isHeaderSent || !responseHeader
+                ? new Uint8Array([...udpSizeBuffer, ...new Uint8Array(dnsQueryResult)])
+                : new Uint8Array([...responseHeader, ...udpSizeBuffer, ...new Uint8Array(dnsQueryResult)]);
+            isHeaderSent = true;
+
+            if (client.isGrpc) {
+                await client.send(fullPacket);
+            } else if (client.readyState === 1) {
+                client.send(fullPacket.buffer);
+            }
+        }
+    })).catch((error) => {
+        log("DNS UDP error" + error);
+    });
+
+    const writer = transformStream.writable.getWriter();
+    return { write: (chunk) => writer.write(chunk) };
+}
+
+// ============================================
+// CAMOUFLAGE MASK WEBSITE (EDGE DIAGNOSTICS)
+// ============================================
 function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0.0.1", colo = "EDGE-LOCAL") {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -472,9 +1535,9 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
           <div class="bench-meta">Cloudflare 1.1.1.1</div>
         </div>
         <div class="bench-box bench-box-3">
-          <div class="bench-label">WebSocket Engine</div>
-          <div class="bench-val">Full-Duplex</div>
-          <div class="bench-meta">RFC 6455 Ready</div>
+          <div class="bench-label">Socket Engine</div>
+          <div class="bench-val">Dual Active</div>
+          <div class="bench-meta">VLESS &amp; Trojan Ready</div>
         </div>
         <div class="bench-box bench-box-4">
           <div class="bench-label">Edge Cluster Location</div>
@@ -496,8 +1559,8 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
           <span class="info-v">${host}</span>
         </div>
         <div class="info-row">
-          <span class="info-k">HTTP Protocol:</span>
-          <span class="info-v">HTTP/2 &amp; HTTP/3 (QUIC)</span>
+          <span class="info-k">Supported Protocols:</span>
+          <span class="info-v" style="color: #0284c7;">VLESS &amp; Trojan (Dual)</span>
         </div>
         <div class="info-row">
           <span class="info-k">Encryption &amp; Cipher:</span>
@@ -516,8 +1579,8 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
           <span class="info-v">100% Operational</span>
         </div>
         <div class="info-row">
-          <span class="info-k">WAF Security Layer:</span>
-          <span class="info-v">Enforced</span>
+          <span class="info-k">Ad &amp; Tracker Blocker:</span>
+          <span class="info-v" style="color: #16a34a;">Active Filter</span>
         </div>
         <div class="info-row">
           <span class="info-k">Service Status:</span>
@@ -541,7 +1604,7 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
         <button class="btn-close" onclick="closePortalModal()">✕</button>
       </div>
       <p style="font-size: 13px; color: #64748b; margin-bottom: 14px; line-height: 1.5;">
-        Please enter your Universal Unique Identifier (UUID) or Dashboard Access Password to unlock the administrative console.
+        Please enter your Universal Unique Identifier (UUID), Trojan Password, or Access Key to unlock the administrative console.
       </p>
       <form onsubmit="handlePortalLogin(event)">
         <input type="password" id="authKeyInput" class="modal-input" placeholder="Enter UUID or Password" required autofocus />
@@ -608,7 +1671,6 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
           submitBtn.disabled = false;
         }
       } catch (err) {
-        // Fallback: direct navigation with key
         window.location.href = '/' + encodeURIComponent(key);
       }
     }
@@ -643,104 +1705,538 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
       btn.textContent = "⚡ Re-Run Benchmark";
     }
 
-    // Auto run once
     setTimeout(runDiagnostics, 500);
   </script>
 </body>
 </html>`;
 }
 
-function trojanUri(host, uuid, path) {
-  const p = `%2F${encodeURIComponent(path)}%3Fed%3D2048`;
-  return `trojan://${encodeURIComponent(uuid)}@${host}:443?security=tls&sni=${host}&type=ws&host=${host}&path=${p}#Galaxy-Trojan%20(${host})`;
-}
-function cookieAuth(request) { return (request.headers.get("Cookie") || "").split(";").some((x) => x.trim() === "galaxy_auth=1"); }
-
-const rateRecords = new Map();
-function rateCheck(ip) { const now = Date.now(); const old = rateRecords.get(ip); if (!old || now - old.start > 60000) { rateRecords.set(ip, { start: now, count: 1 }); return true; } old.count++; return old.count <= DEFAULT_RATE_LIMIT; }
-
-async function handleTrojan(request, env, logger) {
-  const path = normalizePath(env.WS_PATH || DEFAULT_WS_PATH);
-  if (new URL(request.url).pathname.replace(/^\/+|\/+$/g, "") !== path) return new Response("Not found", { status: 404 });
-  const uuid = String(env.UUID || env.uuid || "").trim().toLowerCase();
-  if (!isValidUUID(uuid)) return new Response("Trojan credential is not configured", { status: 503 });
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.binaryType = "arraybuffer";
-  server.accept({ allowHalfOpen: true });
-  const expectedHash = new TextEncoder().encode(hex(sha224Bytes(uuid)));
-  let buffer = new Uint8Array(0), socket = null, writer = null, established = false, closed = false;
-  const timer = setTimeout(() => { if (!established) { logger.warn("TROJAN_HANDSHAKE_TIMEOUT"); try { server.close(1008, "timeout"); } catch {} } }, CONNECTION_TIMEOUT_MS);
-  const closeAll = () => { if (closed) return; closed = true; clearTimeout(timer); try { writer?.releaseLock(); } catch {} try { socket?.close(); } catch {} try { server.close(); } catch {} };
-  const forwardRemote = async () => { try { for await (const chunk of socket.readable) { if (server.readyState === 1) server.send(chunk); } } catch (e) { logger.warn("TROJAN_REMOTE_READ_ERROR", { error: String(e?.message || e) }); } finally { closeAll(); } };
-  const establish = async (payload) => {
-    const crlf = new Uint8Array([13,10]);
-    const hashEnd = indexOfBytes(payload, crlf);
-    if (hashEnd !== 56) throw new Error("invalid trojan credential frame");
-    if (!equalBytes(payload.slice(0,56), expectedHash)) throw new Error("invalid trojan credential");
-    const reqStart = hashEnd + 2;
-    const request = parseAddress(payload, reqStart + 1);
-    if (!request || payload[reqStart] !== 1) throw new Error("unsupported trojan request");
-    if (privateHost(request.host)) throw new Error("private destination blocked");
-    socket = connect({ hostname: request.host, port: request.port });
-    writer = socket.writable.getWriter();
-    established = true; clearTimeout(timer);
-    logger.info("TROJAN_CONNECTED", { target: `${request.host}:${request.port}` });
-    await writer.write(payload.slice(request.end + 2));
-    writer.releaseLock(); writer = null;
-    forwardRemote();
-  };
-  server.addEventListener("message", async (event) => {
-    try {
-      const incoming = typeof event.data === "string" ? new TextEncoder().encode(event.data) : new Uint8Array(await new Response(event.data).arrayBuffer());
-      if (!established) {
-        if (buffer.length + incoming.length > MAX_HANDSHAKE_BYTES) throw new Error("handshake too large");
-        buffer = concat(buffer, incoming);
-        const hashEnd = indexOfBytes(buffer, new Uint8Array([13,10]));
-        if (hashEnd < 0 || hashEnd < 56) return;
-        const reqStart = hashEnd + 2;
-        if (buffer.length < reqStart + 4) return;
-        const type = buffer[reqStart + 3];
-        const addressLen = type === 3 ? (buffer.length > reqStart + 4 ? buffer[reqStart+4] : 0) : type === 1 ? 4 : type === 4 ? 16 : 0;
-        const need = reqStart + 4 + (type === 3 ? 1 : 0) + addressLen + 2 + 2;
-        if (buffer.length < need) return;
-        await establish(buffer); buffer = new Uint8Array(0); return;
-      }
-      if (socket) { const w = socket.writable.getWriter(); await w.write(incoming); w.releaseLock(); }
-    } catch (e) { logger.warn("TROJAN_CONNECTION_REJECTED", { error: String(e?.message || e) }); closeAll(); }
-  });
-  server.addEventListener("close", closeAll); server.addEventListener("error", closeAll);
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-const worker_default = {
-  async fetch(request, env) {
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
-    const logger = new Logger(requestId(), ip);
-    if (!rateCheck(ip)) return new Response(JSON.stringify({ error: "Too Many Requests" }), { status: 429, headers: headers("application/json") });
-    const url = new URL(request.url), path = url.pathname.replace(/^\/+|\/+$/g, "");
-    const uuid = String(env.UUID || env.uuid || "").trim().toLowerCase();
-    const wsPath = normalizePath(env.WS_PATH || DEFAULT_WS_PATH);
-    if (url.pathname === "/health" || url.pathname === "/api/health") return new Response(JSON.stringify({ status: "healthy", service: "galaxy-tunnel-trojan", uuidConfigured: isValidUUID(uuid), wsPath, transport: "trojan-over-websocket", timestamp: new Date().toISOString() }), { headers: headers("application/json") });
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: headers("text/plain") });
-    if (url.pathname === "/api/login" && request.method === "POST") {
-      const body = await request.json().catch(() => ({}));
-      const submitted = String(body.key || body.uuid || "").trim().toLowerCase();
-      if (isValidUUID(uuid) && submitted === uuid) {
-        return new Response(JSON.stringify({ success: true }), { headers: { ...headers("application/json"), "Set-Cookie": "galaxy_auth=1; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly" } });
-      }
-      return new Response(JSON.stringify({ success: false, message: "Invalid UUID" }), { status: 401, headers: headers("application/json") });
+// ============================================
+// GALAXY TUNNEL DUAL VLESS & TROJAN DASHBOARD
+// ============================================
+function getGalaxyPage(host = "localhost", currentUUID = DEFAULT_UUID, currentTrojanPass = DEFAULT_TROJAN_PASS, currentWSPath = DEFAULT_WS_PATH, currentProxy = DEFAULT_PROXY_IP, subData = null) {
+    const defaultSub = subData || generateAllConfigs(host, currentUUID, currentTrojanPass, currentWSPath, currentProxy);
+    const activeTrojan = currentTrojanPass || currentUUID;
+    
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Galaxy-Tunnel | VLESS & Trojan Dual Console</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body, html {
+      width: 100%; height: 100%;
+      background: #02060d; overflow-x: hidden;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      color: #e0f2fe;
     }
-    if (url.pathname === "/sub" && request.method === "GET") {
-      if (!isValidUUID(uuid)) return new Response("Trojan credential is not configured", { status: 503, headers: headers("text/plain") });
-      return new Response(btoa(trojanUri(request.headers.get("Host") || url.host, uuid, wsPath)), { headers: { ...headers("text/plain; charset=utf-8"), "Profile-Update-Interval": "24" } });
+    .space-bg {
+      position: fixed; width: 100%; height: 100%; top: 0; left: 0;
+      background: 
+        radial-gradient(circle at 50% 35%, rgba(10, 45, 80, 0.7) 0%, transparent 65%),
+        radial-gradient(circle at 80% 80%, rgba(0, 150, 200, 0.15) 0%, transparent 50%),
+        #02060d;
+      z-index: 1;
     }
-    if (url.pathname === "/api/logout") return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": "galaxy_auth=0; Path=/; Max-Age=0; SameSite=Lax" } });
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return handleTrojan(request, env, logger);
-    if (path === "" || path === wsPath) return new Response(getMaskPage(request.headers.get("Host") || url.host, isValidUUID(uuid), ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
-    if (cookieAuth(request)) return new Response(getMaskPage(request.headers.get("Host") || url.host, true, ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
-    return new Response(getMaskPage(request.headers.get("Host") || url.host, isValidUUID(uuid), ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
-  }
-};
+    .starfield {
+      position: fixed; width: 100%; height: 100%; top: 0; left: 0;
+      background-image: 
+        radial-gradient(2px 2px at 20px 30px, #ffffff, rgba(0,0,0,0)),
+        radial-gradient(2px 2px at 40px 70px, rgba(0,212,255,0.8), rgba(0,0,0,0)),
+        radial-gradient(1px 1px at 90px 40px, #ffffff, rgba(0,0,0,0)),
+        radial-gradient(2px 2px at 160px 120px, rgba(0,212,255,0.9), rgba(0,0,0,0));
+      background-repeat: repeat; background-size: 220px 220px;
+      animation: starTwinkle 4s ease-in-out infinite alternate; opacity: 0.6;
+      z-index: 2;
+    }
+    @keyframes starTwinkle {
+      0% { opacity: 0.4; transform: scale(1); }
+      100% { opacity: 0.8; transform: scale(1.02); }
+    }
+    .top-nav {
+      position: relative; z-index: 20;
+      width: 100%; max-width: 680px;
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: -10px;
+    }
+    .btn-lock {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fca5a5;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .btn-lock:hover {
+      background: rgba(239, 68, 68, 0.3);
+      color: #ffffff;
+    }
+    .main-container {
+      position: relative; z-index: 10;
+      min-height: 100vh;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      padding: 24px 16px;
+      gap: 20px;
+    }
+    .card-frame {
+      position: relative;
+      width: 100%; max-width: 440px; aspect-ratio: 1 / 1;
+      background: rgba(4, 14, 30, 0.8);
+      border: 1.5px solid rgba(0, 212, 255, 0.6);
+      box-shadow: 0 0 30px rgba(0, 212, 255, 0.25), inset 0 0 25px rgba(0, 212, 255, 0.1);
+      backdrop-filter: blur(12px);
+      display: flex; flex-direction: column; justify-content: space-between; align-items: center;
+      padding: 32px 24px 24px 24px; border-radius: 8px;
+    }
+    .graphic-container {
+      position: relative; width: 200px; height: 200px;
+      display: flex; justify-content: center; align-items: center;
+    }
+    .ring {
+      position: absolute; width: 220px; height: 70px;
+      border: 2px solid rgba(0, 230, 255, 0.85); border-radius: 50%;
+      transform: rotate(-28deg);
+      box-shadow: 0 0 15px rgba(0, 212, 255, 0.8), inset 0 0 15px rgba(0, 212, 255, 0.5);
+      pointer-events: none; animation: ringGlow 3s ease-in-out infinite alternate;
+    }
+    @keyframes ringGlow {
+      0% { opacity: 0.7; box-shadow: 0 0 12px rgba(0,212,255,0.6); }
+      100% { opacity: 1; box-shadow: 0 0 25px rgba(0,212,255,1); }
+    }
+    canvas { position: absolute; top: 0; left: 0; }
+    .content-bottom {
+      width: 100%; display: flex; flex-direction: column; align-items: center;
+      text-align: center; position: relative;
+    }
+    .title {
+      font-size: 28px; font-weight: 900; font-style: italic;
+      color: #ffffff; letter-spacing: 2px; text-transform: uppercase;
+      text-shadow: 0 0 12px rgba(255, 255, 255, 0.7); line-height: 1.1;
+    }
+    .subtitle {
+      font-size: 13px; font-weight: 700; color: #38bdf8;
+      letter-spacing: 3px; margin-top: 4px; text-transform: uppercase;
+    }
+    .status-row {
+      width: 100%; display: flex; justify-content: space-between; align-items: center;
+      margin-top: 14px;
+    }
+    .live-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(0, 229, 255, 0.15); border: 1px solid rgba(0, 229, 255, 0.4);
+      padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; color: #00e5ff;
+    }
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%; background: #00e5ff;
+      box-shadow: 0 0 8px #00e5ff; animation: pulseDot 1.5s infinite;
+    }
+    @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .access-badge {
+      font-size: 13px; font-weight: 900; font-style: italic; color: #00e5ff;
+      text-transform: uppercase; text-align: right; letter-spacing: 1px; line-height: 1.2;
+      text-shadow: 0 0 15px rgba(0, 229, 255, 0.85);
+    }
+    
+    /* Config Panel */
+    .config-panel {
+      width: 100%; max-width: 680px;
+      background: rgba(4, 14, 30, 0.85);
+      border: 1px solid rgba(0, 212, 255, 0.35);
+      border-radius: 8px;
+      padding: 20px;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .panel-header {
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid rgba(0, 212, 255, 0.2);
+      padding-bottom: 12px; margin-bottom: 16px;
+    }
+    .panel-title {
+      font-size: 17px; font-weight: 800; color: #38bdf8;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .tag {
+      font-size: 11px; background: rgba(56, 189, 248, 0.2);
+      color: #38bdf8; padding: 2px 8px; border-radius: 4px; font-weight: normal;
+    }
+    .input-grid {
+      display: grid; grid-template-columns: 1fr; gap: 12px;
+      margin-bottom: 16px;
+    }
+    @media(min-width: 580px) {
+      .input-grid { grid-template-columns: 1fr 1fr; }
+      .input-full { grid-column: span 2; }
+    }
+    .input-group label {
+      display: block; font-size: 12px; font-weight: 600; color: #94a3b8;
+      margin-bottom: 4px;
+    }
+    .input-group input {
+      width: 100%; background: #071527;
+      border: 1px solid rgba(0, 212, 255, 0.3);
+      padding: 8px 12px; border-radius: 6px; color: #ffffff;
+      font-family: monospace; font-size: 13px; outline: none;
+      transition: border-color 0.2s;
+    }
+    .input-group input:focus {
+      border-color: #00e5ff; box-shadow: 0 0 8px rgba(0, 229, 255, 0.3);
+    }
+    .btn-row {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
+    }
+    .btn {
+      background: #0284c7; color: #ffffff;
+      border: none; padding: 8px 14px; border-radius: 6px;
+      font-size: 13px; font-weight: 700; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px;
+      transition: all 0.2s;
+    }
+    .btn:hover { background: #0369a1; transform: translateY(-1px); }
+    .btn-cyan { background: #00e5ff; color: #02060d; }
+    .btn-cyan:hover { background: #38bdf8; }
+    .btn-outline {
+      background: transparent; border: 1px solid rgba(0, 212, 255, 0.4);
+      color: #38bdf8;
+    }
+    .btn-outline:hover { background: rgba(0, 212, 255, 0.1); border-color: #00e5ff; }
+
+    .protocol-section-title {
+      font-size: 13px; font-weight: 800; color: #7dd3fc;
+      text-transform: uppercase; letter-spacing: 1px;
+      margin: 12px 0 8px 0; display: flex; align-items: center; gap: 6px;
+    }
+    .node-list {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .node-card {
+      background: #06182c; border: 1px solid rgba(0, 212, 255, 0.2);
+      border-radius: 6px; padding: 12px;
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    .node-trojan {
+      border-color: rgba(245, 158, 11, 0.35);
+      background: #151421;
+    }
+    .node-info { overflow: hidden; }
+    .node-name { font-size: 13px; font-weight: 700; color: #f0f9ff; }
+    .node-desc { font-size: 11px; color: #64748b; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .copy-btn {
+      flex-shrink: 0; background: rgba(0, 229, 255, 0.15); border: 1px solid rgba(0, 229, 255, 0.3);
+      color: #00e5ff; padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: 700;
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: #00e5ff; color: #02060d; }
+    .copy-btn-trojan {
+      background: rgba(245, 158, 11, 0.15); border-color: rgba(245, 158, 11, 0.4);
+      color: #fbbf24;
+    }
+    .copy-btn-trojan:hover { background: #f59e0b; color: #02060d; }
+    .toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: #0284c7; color: #ffffff; padding: 10px 18px;
+      border-radius: 6px; font-size: 14px; font-weight: bold;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5); z-index: 999;
+      opacity: 0; pointer-events: none; transition: opacity 0.3s;
+    }
+    .toast.show { opacity: 1; pointer-events: auto; }
+  </style>
+</head>
+<body>
+  <div class="space-bg"></div>
+  <div class="starfield"></div>
+
+  <div class="main-container">
+    <div class="top-nav">
+      <span style="font-size: 13px; color: #38bdf8; font-weight: 700; letter-spacing: 1px;">🌌 VLESS &amp; TROJAN ACTIVE</span>
+      <button class="btn-lock" onclick="lockConsole()">🔒 Lock & Return to Disguise</button>
+    </div>
+
+    <!-- Visual Space Frame -->
+    <div class="card-frame">
+      <div class="graphic-container">
+        <div class="ring"></div>
+        <canvas id="nodeCanvas" width="200" height="200"></canvas>
+      </div>
+      <div class="content-bottom">
+        <h1 class="title">GALAXY-TUNNEL</h1>
+        <div class="subtitle">VLESS &amp; TROJAN DUAL ENGINE</div>
+        <div class="status-row">
+          <div class="live-badge"><div class="dot"></div> WORKER & PAGES OK</div>
+          <div class="access-badge">DUAL TUNNEL<br>ACTIVE</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Interactive Configurator -->
+    <div class="config-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          ⚡ Dual VLESS &amp; Trojan Links
+          <span class="tag">Zero-Rebuild Live Setup</span>
+        </div>
+        <button class="btn btn-outline" onclick="generateRandomUUID()" title="Generate new UUID">🎲 New UUID</button>
+      </div>
+
+      <div class="input-grid">
+        <div class="input-group input-full">
+          <label>UUID / Password (Works for Both VLESS &amp; Trojan):</label>
+          <input type="text" id="cfgUUID" value="${currentUUID}" oninput="updateConfigs()" placeholder="Enter your Cloudflare Dashboard UUID or click 🎲 New UUID" />
+        </div>
+        <div class="input-group">
+          <label>Trojan Custom Password (Optional / Defaults to UUID):</label>
+          <input type="text" id="cfgTrojanPass" value="${currentTrojanPass || ""}" oninput="updateConfigs()" placeholder="Leave empty to use same UUID" />
+        </div>
+        <div class="input-group">
+          <label>WebSocket Path (WS_PATH):</label>
+          <input type="text" id="cfgPath" value="${currentWSPath}" oninput="updateConfigs()" placeholder="galaxy-tunnel" />
+        </div>
+        <div class="input-group input-full">
+          <label>Fallback / CDN Proxy IP:</label>
+          <input type="text" id="cfgProxy" value="${currentProxy}" oninput="updateConfigs()" placeholder="cdn-b100.xn--b6gac.eu.org" />
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-cyan" onclick="copyAllNodes()">📋 Copy All (Base64 Sub)</button>
+        <button class="btn btn-outline" onclick="openSubUrl()">🔗 Open Subscription Link</button>
+        <button class="btn btn-outline" onclick="copySubUrl()">📋 Copy Sub URL</button>
+      </div>
+
+      <!-- Trojan Nodes -->
+      <div class="protocol-section-title">🛡️ Trojan Protocol Nodes (Using Same UUID / Password)</div>
+      <div class="node-list">
+        <div class="node-card node-trojan">
+          <div class="node-info">
+            <div class="node-name">🛡️ Trojan + TLS (Port 443 WS)</div>
+            <div class="node-desc" id="trojanTlsDesc">Trojan over WS TLS / SHA-224 Authenticated</div>
+          </div>
+          <button class="copy-btn copy-btn-trojan" onclick="copyNode('trojanTls')">Copy Link</button>
+        </div>
+
+        <div class="node-card node-trojan">
+          <div class="node-info">
+            <div class="node-name">⚡ Trojan + gRPC (Port 443)</div>
+            <div class="node-desc" id="trojanGrpcDesc">Trojan over gRPC Multiplexed Stream</div>
+          </div>
+          <button class="copy-btn copy-btn-trojan" onclick="copyNode('trojanGrpc')">Copy Link</button>
+        </div>
+      </div>
+
+      <!-- VLESS Nodes -->
+      <div class="protocol-section-title" style="margin-top: 18px;">⚡ VLESS Protocol Nodes</div>
+      <div class="node-list">
+        <div class="node-card">
+          <div class="node-info">
+            <div class="node-name">🔒 VLESS + TLS (Port 443 WS)</div>
+            <div class="node-desc" id="tlsDesc">WS / TLS Enabled / Best for v2rayNG &amp; Shadowrocket</div>
+          </div>
+          <button class="copy-btn" onclick="copyNode('vlessTls')">Copy Link</button>
+        </div>
+
+        <div class="node-card">
+          <div class="node-info">
+            <div class="node-name">⚡ VLESS + gRPC (Port 443)</div>
+            <div class="node-desc" id="grpcDesc">gRPC HTTP/2 Low Latency Stream</div>
+          </div>
+          <button class="copy-btn" onclick="copyNode('vlessGrpc')">Copy Link</button>
+        </div>
+
+        <div class="node-card">
+          <div class="node-info">
+            <div class="node-name">🌐 VLESS + Direct HTTP (Port 80)</div>
+            <div class="node-desc" id="httpDesc">Standard WS Port 80</div>
+          </div>
+          <button class="copy-btn" onclick="copyNode('vlessHttp')">Copy Link</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">Copied to clipboard!</div>
+
+  <script>
+    // Star Node Graphic Animation
+    const canvas = document.getElementById('nodeCanvas');
+    const ctx = canvas.getContext('2d');
+    const numNodes = 30; const nodes = []; const radius = 65;
+    let angleX = 0.004; let angleY = 0.007;
+
+    for (let i = 0; i < numNodes; i++) {
+      let theta = Math.acos(Math.random() * 2 - 1);
+      let phi = Math.random() * Math.PI * 2;
+      nodes.push({
+        x: radius * Math.sin(theta) * Math.cos(phi),
+        y: radius * Math.sin(theta) * Math.sin(phi),
+        z: radius * Math.cos(theta)
+      });
+    }
+
+    function rotateX(node, angle) {
+      let cos = Math.cos(angle); let sin = Math.sin(angle);
+      let y1 = node.y * cos - node.z * sin;
+      let z1 = node.z * cos + node.y * sin;
+      node.y = y1; node.z = z1;
+    }
+
+    function rotateY(node, angle) {
+      let cos = Math.cos(angle); let sin = Math.sin(angle);
+      let x1 = node.x * cos - node.z * sin;
+      let z1 = node.z * cos + node.x * sin;
+      node.x = x1; node.z = z1;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      let cx = canvas.width / 2; let cy = canvas.height / 2;
+
+      nodes.forEach(node => {
+        rotateX(node, angleX);
+        rotateY(node, angleY);
+      });
+
+      ctx.strokeStyle = 'rgba(0, 220, 255, 0.35)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          let dist = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y, nodes[i].z - nodes[j].z);
+          if (dist < 55) {
+            ctx.beginPath();
+            ctx.moveTo(nodes[i].x + cx, nodes[i].y + cy);
+            ctx.lineTo(nodes[j].x + cx, nodes[j].y + cy);
+            ctx.stroke();
+          }
+        }
+      }
+
+      nodes.forEach(node => {
+        let size = (node.z + radius) / (2 * radius) * 2.8 + 1.8;
+        ctx.beginPath();
+        ctx.arc(node.x + cx, node.y + cy, size, 0, Math.PI * 2);
+        ctx.fillStyle = '#00f0ff';
+        ctx.shadowBlur = 8; ctx.shadowColor = '#00f0ff';
+        ctx.fill(); ctx.shadowBlur = 0;
+      });
+
+      requestAnimationFrame(draw);
+    }
+    draw();
+
+    // Configuration & Dynamic Link Generator
+    const currentHost = window.location.host || "${host}";
+    let generatedLinks = {};
+
+    function updateConfigs() {
+      const uuid = (document.getElementById('cfgUUID').value || "${currentUUID}").trim();
+      const customTrojan = (document.getElementById('cfgTrojanPass').value || "").trim();
+      const trojanKey = customTrojan || uuid;
+      const path = (document.getElementById('cfgPath').value || "${currentWSPath}").trim().replace(/^\\/+/, "");
+      const proxy = (document.getElementById('cfgProxy').value || "${currentProxy}").trim();
+      const cleanHost = currentHost.replace(/[^a-zA-Z0-9.-]/g, "");
+
+      const vlessTls = "vless://" + uuid + "@" + currentHost + ":443?encryption=none&security=tls&sni=" + currentHost + "&type=ws&host=" + currentHost + "&path=%2F" + encodeURIComponent(path) + "%3Fed%3D2048#Galaxy-VLESS-TLS%20(" + cleanHost + ")";
+      const vlessGrpc = "vless://" + uuid + "@" + currentHost + ":443?encryption=none&security=tls&sni=" + currentHost + "&type=grpc&serviceName=" + encodeURIComponent(path) + "#Galaxy-VLESS-gRPC%20(" + cleanHost + ")";
+      const vlessHttp = "vless://" + uuid + "@" + currentHost + ":80?encryption=none&security=none&type=ws&host=" + currentHost + "&path=%2F" + encodeURIComponent(path) + "%3Fed%3D2048#Galaxy-VLESS-HTTP%20(" + cleanHost + ")";
+
+      const trojanTls = "trojan://" + encodeURIComponent(trojanKey) + "@" + currentHost + ":443?security=tls&sni=" + currentHost + "&type=ws&host=" + currentHost + "&path=%2F" + encodeURIComponent(path) + "%3Fed%3D2048#Galaxy-Trojan-TLS%20(" + cleanHost + ")";
+      const trojanGrpc = "trojan://" + encodeURIComponent(trojanKey) + "@" + currentHost + ":443?security=tls&sni=" + currentHost + "&type=grpc&serviceName=" + encodeURIComponent(path) + "#Galaxy-Trojan-gRPC%20(" + cleanHost + ")";
+
+      const allLinks = [vlessTls, trojanTls, vlessGrpc, trojanGrpc, vlessHttp];
+
+      generatedLinks = {
+        vlessTls,
+        vlessGrpc,
+        vlessHttp,
+        trojanTls,
+        trojanGrpc,
+        all: allLinks.join('\\n'),
+        base64: btoa(unescape(encodeURIComponent(allLinks.join('\\n'))))
+      };
+    }
+    updateConfigs();
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2500);
+    }
+
+    function copyNode(type) {
+      const uuid = (document.getElementById('cfgUUID').value || "").trim();
+      if (!uuid) {
+        showToast('⚠️ Please enter or generate a UUID first!');
+        return;
+      }
+      if (generatedLinks[type]) {
+        navigator.clipboard.writeText(generatedLinks[type]).then(() => {
+          showToast('Copied ' + type.toUpperCase() + ' link!');
+        });
+      }
+    }
+
+    function copyAllNodes() {
+      const uuid = (document.getElementById('cfgUUID').value || "").trim();
+      if (!uuid) {
+        showToast('⚠️ Please enter or generate a UUID first!');
+        return;
+      }
+      if (generatedLinks.base64) {
+        navigator.clipboard.writeText(generatedLinks.base64).then(() => {
+          showToast('Copied Base64 subscription with VLESS & Trojan!');
+        });
+      }
+    }
+
+    function getSubUrl() {
+      const uuid = (document.getElementById('cfgUUID').value || "${currentUUID}").trim();
+      const trojan = (document.getElementById('cfgTrojanPass').value || "").trim();
+      const path = (document.getElementById('cfgPath').value || "${currentWSPath}").trim();
+      const proxy = (document.getElementById('cfgProxy').value || "${currentProxy}").trim();
+      let url = window.location.origin + "/sub?uuid=" + encodeURIComponent(uuid) + "&path=" + encodeURIComponent(path) + "&proxyip=" + encodeURIComponent(proxy);
+      if (trojan) {
+        url += "&trojan=" + encodeURIComponent(trojan);
+      }
+      return url;
+    }
+
+    function copySubUrl() {
+      const subUrl = getSubUrl();
+      navigator.clipboard.writeText(subUrl).then(() => {
+        showToast('Copied Subscription URL!');
+      });
+    }
+
+    function openSubUrl() {
+      window.open(getSubUrl(), '_blank');
+    }
+
+    function generateRandomUUID() {
+      const newUUID = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+      document.getElementById('cfgUUID').value = newUUID;
+      updateConfigs();
+      showToast('Generated new UUID (powers both VLESS & Trojan)!');
+    }
+
+    function lockConsole() {
+      document.cookie = "galaxy_auth=0; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+      window.location.href = "/api/logout";
+    }
+  </script>
+</body>
+</html>`;
+}
 
 export default worker_default;

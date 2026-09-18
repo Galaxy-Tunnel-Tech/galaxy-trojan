@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================
 const DEFAULT_UUID = "";
 const DEFAULT_TROJAN_PASS = "";
-const DEFAULT_PROXY_IP = ["www.visa.com.sg";"icook.hk"];
+const DEFAULT_PROXY_IP = "www.visa.com.sg";
 const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
 const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query",
 "https://dns.google/dns-query",

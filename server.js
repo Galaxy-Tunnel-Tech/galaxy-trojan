@@ -1,318 +1,101 @@
-import express from 'express';
-import cors from 'cors';
-import crypto from 'crypto';
+import { connect } from "cloudflare:sockets";
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const DEFAULT_WS_PATH = "trojan-ws";
+const DEFAULT_RATE_LIMIT = 60;
+const CONNECTION_TIMEOUT_MS = 30000;
+const MAX_HANDSHAKE_BYTES = 4096;
 
-const PORT = process.env.PORT || 3000;
-
-const DEFAULT_LOCAL_PROXIES = [
-  "bpb.yousef.isegaro.com",
-  "icook.hk",
-  "icook.tw",
-  "www.visa.com.sg"
-];
-
-const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query","https://dns.google/dns-query","https://dns.quad9.net/dns-query","https://dns.adguard-dns.com/dns-query"];
-const CONNECTION_TIMEOUT_MS = 30000; // 30 seconds timeout
-const DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
-const DEFAULT_WS_PATH = "galaxy-tunnel";
-const MAX_CONFIG_PATH_LENGTH = 128;
-
-function isValidUUID(uuid) {
-  if (!uuid || typeof uuid !== "string") return false;
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(uuid.trim());
+class Logger {
+  constructor(requestId, clientIp) { this.requestId = requestId; this.clientIp = clientIp; }
+  log(level, event, details = {}) {
+    const entry = { timestamp: new Date().toISOString(), level, requestId: this.requestId, clientIp: this.clientIp, event, ...details };
+    (level === "ERROR" ? console.error : level === "WARN" ? console.warn : console.log)(JSON.stringify(entry));
+  }
+  info(event, details) { this.log("INFO", event, details); }
+  warn(event, details) { this.log("WARN", event, details); }
+  error(event, details) { this.log("ERROR", event, details); }
 }
 
-function getGalaxyPage() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
-  <title>Galaxy-Tunnel Trojan</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body, html {
-      width: 100%; height: 100%;
-      background: #02060d; overflow: hidden;
-      font-family: 'Segoe UI', Arial, sans-serif;
-      display: flex; justify-content: center; align-items: center;
-    }
-    .space-bg {
-      position: absolute; width: 100%; height: 100%;
-      background: 
-        radial-gradient(circle at 50% 35%, rgba(10, 45, 80, 0.7) 0%, transparent 65%),
-        radial-gradient(circle at 80% 80%, rgba(0, 150, 200, 0.15) 0%, transparent 50%),
-        #02060d;
-      z-index: 1;
-    }
-    .starfield {
-      position: absolute; width: 100%; height: 100%;
-      background-image: 
-        radial-gradient(2px 2px at 20px 30px, #ffffff, rgba(0,0,0,0)),
-        radial-gradient(2px 2px at 40px 70px, rgba(0,212,255,0.8), rgba(0,0,0,0)),
-        radial-gradient(1px 1px at 90px 40px, #ffffff, rgba(0,0,0,0)),
-        radial-gradient(2px 2px at 160px 120px, rgba(0,212,255,0.9), rgba(0,0,0,0));
-      background-repeat: repeat; background-size: 220px 220px;
-      animation: starTwinkle 4s ease-in-out infinite alternate; opacity: 0.6;
-    }
-    @keyframes starTwinkle {
-      0% { opacity: 0.4; transform: scale(1); }
-      100% { opacity: 0.8; transform: scale(1.02); }
-    }
-    .card-frame {
-      position: relative; z-index: 10;
-      width: 90vw; max-width: 480px; aspect-ratio: 1 / 1;
-      background: rgba(4, 12, 24, 0.75);
-      border: 1.5px solid rgba(0, 212, 255, 0.6);
-      box-shadow: 0 0 25px rgba(0, 212, 255, 0.25), inset 0 0 25px rgba(0, 212, 255, 0.1);
-      backdrop-filter: blur(12px);
-      display: flex; flex-direction: column; justify-content: space-between; align-items: center;
-      padding: 35px 25px 25px 25px; border-radius: 4px;
-    }
-    .graphic-container {
-      position: relative; width: 230px; height: 230px;
-      display: flex; justify-content: center; align-items: center;
-    }
-    .ring {
-      position: absolute; width: 240px; height: 75px;
-      border: 2px solid rgba(0, 230, 255, 0.85); border-radius: 50%;
-      transform: rotate(-28deg);
-      box-shadow: 0 0 15px rgba(0, 212, 255, 0.8), inset 0 0 15px rgba(0, 212, 255, 0.5);
-      pointer-events: none; animation: ringGlow 3s ease-in-out infinite alternate;
-    }
-    @keyframes ringGlow {
-      0% { opacity: 0.7; box-shadow: 0 0 12px rgba(0,212,255,0.6); }
-      100% { opacity: 1; box-shadow: 0 0 25px rgba(0,212,255,1); }
-    }
-    canvas { position: absolute; top: 0; left: 0; }
-    .content-bottom {
-      width: 100%; display: flex; flex-direction: column; align-items: center;
-      text-align: center; position: relative;
-    }
-    .title {
-      font-size: 34px; font-weight: 900; font-style: italic;
-      color: #ffffff; letter-spacing: 2px; text-transform: uppercase;
-      text-shadow: 0 0 12px rgba(255, 255, 255, 0.7); line-height: 1.1;
-    }
-    .subtitle {
-      font-size: 16px; font-weight: 600; color: #7b93a7;
-      letter-spacing: 5px; margin-top: 6px; text-transform: uppercase;
-    }
-    .access-badge {
-      align-self: flex-end; margin-top: 15px; font-size: 20px;
-      font-weight: 900; font-style: italic; color: #00e5ff;
-      text-transform: uppercase; text-align: right; letter-spacing: 1px; line-height: 1.1;
-      text-shadow: 0 0 15px rgba(0, 229, 255, 0.85); animation: statusPulse 2s infinite alternate;
-    }
-    @keyframes statusPulse {
-      0% { opacity: 0.8; text-shadow: 0 0 8px rgba(0,229,255,0.5); }
-      100% { opacity: 1; text-shadow: 0 0 20px rgba(0,229,255,1); }
-    }
-  </style>
-</head>
-<body>
-  <div class="space-bg"></div>
-  <div class="starfield"></div>
-  <div class="card-frame" id="mainCard">
-    <div class="graphic-container">
-      <div class="ring"></div>
-      <canvas id="nodeCanvas" width="230" height="230"></canvas>
-    </div>
-    <div class="content-bottom">
-      <h1 class="title">GALAXY-TUNNEL</h1>
-      <div class="subtitle">TROJAN CONFIG</div>
-      <div class="access-badge">
-        GALAXY VPROXY<br>IS ACCESS
-      </div>
-    </div>
-  </div>
-  <script>
-    const canvas = document.getElementById('nodeCanvas');
-    const ctx = canvas.getContext('2d');
-    const numNodes = 32; const nodes = []; const radius = 75;
-    let angleX = 0.004; let angleY = 0.007;
-
-    for (let i = 0; i < numNodes; i++) {
-      let theta = Math.acos(Math.random() * 2 - 1);
-      let phi = Math.random() * Math.PI * 2;
-      nodes.push({
-        x: radius * Math.sin(theta) * Math.cos(phi),
-        y: radius * Math.sin(theta) * Math.sin(phi),
-        z: radius * Math.cos(theta)
-      });
-    }
-
-    function rotateX(node, angle) {
-      let cos = Math.cos(angle); let sin = Math.sin(angle);
-      let y1 = node.y * cos - node.z * sin;
-      let z1 = node.z * cos + node.y * sin;
-      node.y = y1; node.z = z1;
-    }
-
-    function rotateY(node, angle) {
-      let cos = Math.cos(angle); let sin = Math.sin(angle);
-      let x1 = node.x * cos - node.z * sin;
-      let z1 = node.z * cos + node.x * sin;
-      node.x = x1; node.z = z1;
-    }
-
-    function draw() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      let cx = canvas.width / 2; let cy = canvas.height / 2;
-
-      nodes.forEach(node => {
-        rotateX(node, angleX);
-        rotateY(node, angleY);
-      });
-
-      ctx.strokeStyle = 'rgba(0, 220, 255, 0.35)';
-      ctx.lineWidth = 1;
-      for (let i = 0; i < nodes.length; i++) {
-        for (let j = i + 1; j < nodes.length; j++) {
-          let dist = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y, nodes[i].z - nodes[j].z);
-          if (dist < 60) {
-            ctx.beginPath();
-            ctx.moveTo(nodes[i].x + cx, nodes[i].y + cy);
-            ctx.lineTo(nodes[j].x + cx, nodes[j].y + cy);
-            ctx.stroke();
-          }
-        }
-      }
-
-      nodes.forEach(node => {
-        let size = (node.z + radius) / (2 * radius) * 3 + 2;
-        ctx.beginPath();
-        ctx.arc(node.x + cx, node.y + cy, size, 0, Math.PI * 2);
-        ctx.fillStyle = '#00f0ff';
-        ctx.shadowBlur = 8; ctx.shadowColor = '#00f0ff';
-        ctx.fill(); ctx.shadowBlur = 0;
-      });
-
-      requestAnimationFrame(draw);
-    }
-    draw();
-  </script>
-</body>
-</html>`;
+function requestId() { return crypto.randomUUID?.() || `req_${Math.random().toString(36).slice(2, 12)}`; }
+function isValidUUID(value) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim()); }
+function normalizePath(value) {
+  const path = String(value || DEFAULT_WS_PATH).trim().replace(/^\/+|\/+$/g, "");
+  return path && path.length <= 128 && !/[\s?#\\]/.test(path) ? path : DEFAULT_WS_PATH;
+}
+function headers(type = "text/html; charset=utf-8") {
+  return {
+    "Content-Type": type,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version, Sec-WebSocket-Protocol",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Robots-Tag": "noindex, nofollow, noarchive, nosnippet"
+  };
 }
 
-// 401 Unauthorized Step-by-Step Setup Page (Item 1)
-function getUnauthorizedPage() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
-  <title>401 Unauthorized - Galaxy-Tunnel Setup</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #090d16; color: #e2e8f0;
-      min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      padding: 24px; line-height: 1.6;
+// SHA-224 is required by the Trojan protocol. This implementation hashes the UUID credential.
+function sha224Bytes(input) {
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  const H = [0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4];
+  const bytes = input instanceof Uint8Array ? input : new TextEncoder().encode(input);
+  const bitLen = bytes.length * 8;
+  const padded = new Uint8Array(((bytes.length + 9 + 63) >> 6) << 6);
+  padded.set(bytes); padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
+  view.setUint32(padded.length - 4, bitLen >>> 0);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    const w = new Uint32Array(64);
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >>> 3);
+      const s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
     }
-    .container {
-      max-width: 620px; width: 100%;
-      background: rgba(15, 23, 42, 0.95);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      border-radius: 12px; padding: 32px 28px;
-      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+      const S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      [h,g,f,e,d,c,b,a] = [g,f,e,(d+t1)>>>0,c,b,a,(t1+t2)>>>0];
     }
-    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-    .badge {
-      background: #ef4444; color: #fff; font-weight: 700;
-      font-size: 12px; padding: 4px 10px; border-radius: 9999px;
-      letter-spacing: 0.5px;
-    }
-    h1 { font-size: 22px; color: #f8fafc; font-weight: 700; }
-    p { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
-    .step-list { list-style: none; display: flex; flex-direction: column; gap: 16px; }
-    .step-item {
-      background: rgba(30, 41, 59, 0.7);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      border-radius: 8px; padding: 14px 16px;
-    }
-    .step-title {
-      font-weight: 600; font-size: 14px; color: #38bdf8;
-      display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
-    }
-    .step-desc { font-size: 13px; color: #cbd5e1; }
-    code {
-      background: #020617; color: #38bdf8;
-      padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px;
-    }
-    .step-num {
-      background: #0284c7; color: #fff; border-radius: 50%;
-      width: 20px; height: 20px; display: inline-flex;
-      align-items: center; justify-content: center; font-size: 11px; font-weight: bold;
-    }
-    .footer-note {
-      margin-top: 24px; font-size: 12px; color: #64748b; text-align: center;
-    }
-  </style>
-</head>
-<body>
-  <div class="container" id="unauthorizedContainer">
-    <div class="header">
-      <span class="badge">401 UNAUTHORIZED</span>
-      <h1>UUID/Password Configuration Required</h1>
-    </div>
-    <p>Galaxy-Tunnel Trojan server is running, but no valid authentication (UUID or Password) has been configured.</p>
-    <ul class="step-list">
-      <li class="step-item">
-        <div class="step-title"><span class="step-num">1</span> Generate a secure Password or UUID</div>
-        <div class="step-desc">Create a strong password, or run <code>uuidgen</code> in your terminal or generate one at <a href="https://www.uuidgenerator.net" target="_blank" rel="noopener" style="color:#38bdf8;">uuidgenerator.net</a>.</div>
-      </li>
-      <li class="step-item">
-        <div class="step-title"><span class="step-num">2</span> Set the Environment Variable</div>
-        <div class="step-desc">Set the <code>TROJAN_PASSWORD</code> or <code>UUID</code> environment variable in your deployment environment.</div>
-      </li>
-      <li class="step-item">
-        <div class="step-title"><span class="step-num">3</span> Configure Your Client</div>
-        <div class="step-desc">In V2Ray, v2rayN, Sing-box, Clash, or NekoBox, add a Trojan node with WebSocket transport pointing to your domain on port 443 with TLS enabled.</div>
-      </li>
-      <li class="step-item">
-        <div class="step-title"><span class="step-num">4</span> Redeploy / Reload</div>
-        <div class="step-desc">Deploy your app and test the connection.</div>
-      </li>
-    </ul>
-    <div class="footer-note">Galaxy-Tunnel Trojan Security Guard &bull; Automatic Access Protection</div>
-  </div>
-</body>
-</html>`;
+    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
+  }
+  const out = new Uint8Array(28);
+  const outView = new DataView(out.buffer);
+  H.slice(0, 7).forEach((v, i) => outView.setUint32(i * 4, v));
+  return out;
+}
+function hex(bytes) { return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join(""); }
+function concat(...parts) { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let i = 0; for (const p of parts) { out.set(p, i); i += p.length; } return out; }
+function indexOfBytes(haystack, needle, start = 0) { outer: for (let i = start; i <= haystack.length - needle.length; i++) { for (let j = 0; j < needle.length; j++) if (haystack[i+j] !== needle[j]) continue outer; return i; } return -1; }
+function equalBytes(a, b) { if (a.length !== b.length) return false; let x = 0; for (let i=0;i<a.length;i++) x |= a[i] ^ b[i]; return x === 0; }
+function privateHost(host) { const h = String(host || "").toLowerCase().replace(/^\[|\]$/g, ""); if (!h || h === "localhost" || h.endsWith(".local") || h.endsWith(".internal")) return true; const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/); if (!m) return h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:"); const [a,b] = [+m[1], +m[2]]; return a===0 || a===10 || a===127 || (a===169&&b===254) || (a===172&&b>=16&&b<=31) || (a===192&&b===168) || (a===100&&b>=64&&b<=127); }
+function parseAddress(bytes, index) {
+  const type = bytes[index++];
+  if (type === 1) { if (bytes.length < index + 4 + 2) return null; const host = [...bytes.slice(index,index+4)].join("."); index += 4; return { host, port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
+  if (type === 3) { const n = bytes[index++]; if (!n || bytes.length < index+n+2) return null; const host = new TextDecoder().decode(bytes.slice(index,index+n)); index += n; return { host, port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
+  if (type === 4) { if (bytes.length < index + 16 + 2) return null; const h = []; for (let i=0;i<16;i+=2) h.push(((bytes[index+i]<<8)|bytes[index+i+1]).toString(16)); index += 16; return { host: h.join(":"), port: (bytes[index]<<8)|bytes[index+1], end: index+2 }; }
+  return null;
 }
 
-// 404 Camouflage Page (Item 11)
-function getCamouflage404() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
-  <title>404 Not Found</title>
-  <style>
-    body{font-family:sans-serif;background:#fff;color:#222;text-align:center;padding:50px;}
-    h1{font-size:32px;margin-bottom:10px;}p{color:#666;}
-  </style>
-</head>
-<body>
-  <h1>404 Not Found</h1>
-  <p>The requested resource was not found on this server.</p>
-</body>
-</html>`;
-}
-
-// ============================================
-// CAMOUFLAGE MASK WEBSITE (EDGE DIAGNOSTICS)
-// ============================================
 function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0.0.1", colo = "EDGE-LOCAL") {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -868,78 +651,97 @@ function getMaskPage(host = "localhost", isAuthEnabled = true, clientIp = "127.0
 </html>`;
 }
 
+function trojanUri(host, uuid, path) {
+  const p = `%2F${encodeURIComponent(path)}%3Fed%3D2048`;
+  return `trojan://${encodeURIComponent(uuid)}@${host}:443?security=tls&sni=${host}&type=ws&host=${host}&path=${p}#Galaxy-Trojan%20(${host})`;
+}
+function cookieAuth(request) { return (request.headers.get("Cookie") || "").split(";").some((x) => x.trim() === "galaxy_auth=1"); }
 
-// ============================================
-// TROJAN CONFIGURATION & SUBSCRIPTION OUTPUT
-// ============================================
+const rateRecords = new Map();
+function rateCheck(ip) { const now = Date.now(); const old = rateRecords.get(ip); if (!old || now - old.start > 60000) { rateRecords.set(ip, { start: now, count: 1 }); return true; } old.count++; return old.count <= DEFAULT_RATE_LIMIT; }
 
-
-function generateTrojanConfigs(host, uuid, wsPath, proxyIP = "", trojanPassword = "") {
-  // Use trojanPassword if available, fallback to uuid
-  const authKey = trojanPassword || uuid;
-  // Mock config generation for UI
-  return {
-    tls: `trojan://${authKey}@${host}:443?type=ws&path=/${wsPath}#Galaxy-Trojan`,
-    plainList: "trojan...",
-    base64: Buffer.from("trojan...").toString("base64")
+async function handleTrojan(request, env, logger) {
+  const path = normalizePath(env.WS_PATH || DEFAULT_WS_PATH);
+  if (new URL(request.url).pathname.replace(/^\/+|\/+$/g, "") !== path) return new Response("Not found", { status: 404 });
+  const uuid = String(env.UUID || env.uuid || "").trim().toLowerCase();
+  if (!isValidUUID(uuid)) return new Response("Trojan credential is not configured", { status: 503 });
+  const pair = new WebSocketPair();
+  const [client, server] = Object.values(pair);
+  server.binaryType = "arraybuffer";
+  server.accept({ allowHalfOpen: true });
+  const expectedHash = new TextEncoder().encode(hex(sha224Bytes(uuid)));
+  let buffer = new Uint8Array(0), socket = null, writer = null, established = false, closed = false;
+  const timer = setTimeout(() => { if (!established) { logger.warn("TROJAN_HANDSHAKE_TIMEOUT"); try { server.close(1008, "timeout"); } catch {} } }, CONNECTION_TIMEOUT_MS);
+  const closeAll = () => { if (closed) return; closed = true; clearTimeout(timer); try { writer?.releaseLock(); } catch {} try { socket?.close(); } catch {} try { server.close(); } catch {} };
+  const forwardRemote = async () => { try { for await (const chunk of socket.readable) { if (server.readyState === 1) server.send(chunk); } } catch (e) { logger.warn("TROJAN_REMOTE_READ_ERROR", { error: String(e?.message || e) }); } finally { closeAll(); } };
+  const establish = async (payload) => {
+    const crlf = new Uint8Array([13,10]);
+    const hashEnd = indexOfBytes(payload, crlf);
+    if (hashEnd !== 56) throw new Error("invalid trojan credential frame");
+    if (!equalBytes(payload.slice(0,56), expectedHash)) throw new Error("invalid trojan credential");
+    const reqStart = hashEnd + 2;
+    const request = parseAddress(payload, reqStart + 1);
+    if (!request || payload[reqStart] !== 1) throw new Error("unsupported trojan request");
+    if (privateHost(request.host)) throw new Error("private destination blocked");
+    socket = connect({ hostname: request.host, port: request.port });
+    writer = socket.writable.getWriter();
+    established = true; clearTimeout(timer);
+    logger.info("TROJAN_CONNECTED", { target: `${request.host}:${request.port}` });
+    await writer.write(payload.slice(request.end + 2));
+    writer.releaseLock(); writer = null;
+    forwardRemote();
   };
+  server.addEventListener("message", async (event) => {
+    try {
+      const incoming = typeof event.data === "string" ? new TextEncoder().encode(event.data) : new Uint8Array(await new Response(event.data).arrayBuffer());
+      if (!established) {
+        if (buffer.length + incoming.length > MAX_HANDSHAKE_BYTES) throw new Error("handshake too large");
+        buffer = concat(buffer, incoming);
+        const hashEnd = indexOfBytes(buffer, new Uint8Array([13,10]));
+        if (hashEnd < 0 || hashEnd < 56) return;
+        const reqStart = hashEnd + 2;
+        if (buffer.length < reqStart + 4) return;
+        const type = buffer[reqStart + 3];
+        const addressLen = type === 3 ? (buffer.length > reqStart + 4 ? buffer[reqStart+4] : 0) : type === 1 ? 4 : type === 4 ? 16 : 0;
+        const need = reqStart + 4 + (type === 3 ? 1 : 0) + addressLen + 2 + 2;
+        if (buffer.length < need) return;
+        await establish(buffer); buffer = new Uint8Array(0); return;
+      }
+      if (socket) { const w = socket.writable.getWriter(); await w.write(incoming); w.releaseLock(); }
+    } catch (e) { logger.warn("TROJAN_CONNECTION_REJECTED", { error: String(e?.message || e) }); closeAll(); }
+  });
+  server.addEventListener("close", closeAll); server.addEventListener("error", closeAll);
+  return new Response(null, { status: 101, webSocket: client });
 }
 
-app.get('/', (req, res) => {
-  const host = req.hostname || "localhost";
-  const clientIp = req.ip || "127.0.0.1";
-  res.send(getMaskPage(host, true, clientIp, "AI-STUDIO"));
-});
-
-app.get('/health', (req, res) => res.json({ status: "healthy", service: "galaxy-tunnel-trojan" }));
-app.get('/api/health', (req, res) => res.json({ status: "healthy", service: "galaxy-tunnel-trojan" }));
-
-app.post('/api/login', (req, res) => {
-  const body = req.body || {};
-  const submittedKey = String(body.key || body.password || body.uuid || "").trim();
-  const userID = process.env.UUID || "";
-  const envPassword = process.env.PASSWORD || process.env.TROJAN_PASSWORD || "";
-  
-  const validUuidKey = isValidUUID(userID) && submittedKey.toLowerCase() === userID.toLowerCase();
-  const validPasswordKey = Boolean(envPassword) && submittedKey === envPassword;
-  
-  if (validUuidKey || validPasswordKey) {
-    res.cookie("galaxy_auth", "1", { maxAge: 86400000 });
-    return res.json({ success: true, redirect: isValidUUID(userID) ? `/${userID}` : "/" });
+const worker_default = {
+  async fetch(request, env) {
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    const logger = new Logger(requestId(), ip);
+    if (!rateCheck(ip)) return new Response(JSON.stringify({ error: "Too Many Requests" }), { status: 429, headers: headers("application/json") });
+    const url = new URL(request.url), path = url.pathname.replace(/^\/+|\/+$/g, "");
+    const uuid = String(env.UUID || env.uuid || "").trim().toLowerCase();
+    const wsPath = normalizePath(env.WS_PATH || DEFAULT_WS_PATH);
+    if (url.pathname === "/health" || url.pathname === "/api/health") return new Response(JSON.stringify({ status: "healthy", service: "galaxy-tunnel-trojan", uuidConfigured: isValidUUID(uuid), wsPath, transport: "trojan-over-websocket", timestamp: new Date().toISOString() }), { headers: headers("application/json") });
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: headers("text/plain") });
+    if (url.pathname === "/api/login" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const submitted = String(body.key || body.uuid || "").trim().toLowerCase();
+      if (isValidUUID(uuid) && submitted === uuid) {
+        return new Response(JSON.stringify({ success: true }), { headers: { ...headers("application/json"), "Set-Cookie": "galaxy_auth=1; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly" } });
+      }
+      return new Response(JSON.stringify({ success: false, message: "Invalid UUID" }), { status: 401, headers: headers("application/json") });
+    }
+    if (url.pathname === "/sub" && request.method === "GET") {
+      if (!isValidUUID(uuid)) return new Response("Trojan credential is not configured", { status: 503, headers: headers("text/plain") });
+      return new Response(btoa(trojanUri(request.headers.get("Host") || url.host, uuid, wsPath)), { headers: { ...headers("text/plain; charset=utf-8"), "Profile-Update-Interval": "24" } });
+    }
+    if (url.pathname === "/api/logout") return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": "galaxy_auth=0; Path=/; Max-Age=0; SameSite=Lax" } });
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return handleTrojan(request, env, logger);
+    if (path === "" || path === wsPath) return new Response(getMaskPage(request.headers.get("Host") || url.host, isValidUUID(uuid), ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
+    if (cookieAuth(request)) return new Response(getMaskPage(request.headers.get("Host") || url.host, true, ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
+    return new Response(getMaskPage(request.headers.get("Host") || url.host, isValidUUID(uuid), ip, request.cf?.colo || "EDGE-GLOBAL"), { headers: headers() });
   }
-  
-  res.status(401).json({ success: false, message: "Invalid UUID or Password" });
-});
+};
 
-app.get('/api/logout', (req, res) => {
-  res.clearCookie("galaxy_auth");
-  res.redirect('/');
-});
-
-app.get('/sub', (req, res) => {
-  const userID = process.env.UUID || "";
-  if (!isValidUUID(userID)) {
-    return res.status(401).send("UUID is not configured");
-  }
-  res.send(generateTrojanConfigs(req.hostname, userID, process.env.WS_PATH || "galaxy-tunnel", "", process.env.TROJAN_PASSWORD).base64);
-});
-
-app.get('/:uuid', (req, res, next) => {
-  const userID = process.env.UUID || "";
-  if (isValidUUID(req.params.uuid) && req.params.uuid.toLowerCase() === userID.toLowerCase()) {
-    return res.send(getGalaxyPage());
-  }
-  if (req.params.uuid === 'unauthorized') {
-    return res.send(getUnauthorizedPage());
-  }
-  next();
-});
-
-// Fallback to camouflage 404
-app.use((req, res) => {
-  res.status(404).send(getCamouflage404());
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
+export default worker_default;

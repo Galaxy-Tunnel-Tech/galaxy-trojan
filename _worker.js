@@ -1,5 +1,4 @@
 import { connect } from "cloudflare:sockets";
-
 const DEFAULT_WS_PATH = "trojan-ws";
 const DEFAULT_RATE_LIMIT = 60;
 const CONNECTION_TIMEOUT_MS = 30000;

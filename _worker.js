@@ -20,9 +20,10 @@ let githubProxyURL = DEFAULT_PROXY_URL;
 let dohURL = DEFAULT_DOH_URL;
 let dohURLs = [
     DEFAULT_DOH_URL,
-    "https://dns.google/dns-query",
-    "https://dns.quad9.net/dns-query"
-];
+"https://cloudflare-dns.com/dns-query",
+"https://dns.google/dns-query",
+"https://dns.quad9.net/dns-query",
+"https://dns.adguard-dns.com/dns-query"];
 let wsPath = DEFAULT_WS_PATH;
 
 // ============================================

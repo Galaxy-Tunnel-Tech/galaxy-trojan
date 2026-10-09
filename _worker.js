@@ -6,11 +6,11 @@ import { connect } from "cloudflare:sockets";
 const DEFAULT_UUID = "";
 const DEFAULT_TROJAN_PASS = "";
 const DEFAULT_PROXY_IP = "galaxytunne.cloud-ip.cc";
-const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
+const DEFAULT_PROXY_URL = "";
 const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query",
 "https://dns.google/dns-query",
 "https://dns.quad9.net/dns-query",
-"https://dns.adguard-dns.com/dns-query"];
+"https://dns.alidns.com/dns-query"];
 const DEFAULT_WS_PATH = "galaxy-tunnel";
 
 let userID = "";
@@ -100,8 +100,8 @@ function isValidUUID(uuid) {
 const DEFAULT_LOCAL_PROXIES = [
     "galaxytunnel.cloud-ip.cc",
     "bpb.yousef.isegaro.com",
-    "icook.hk",
-    "icook.tw",
+    "www.visa.com.hk",
+    "www.visa.com.jp",
     "www.visa.com.sg"
 ];
 

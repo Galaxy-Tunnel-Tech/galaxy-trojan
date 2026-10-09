@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================
 const DEFAULT_UUID = "";
 const DEFAULT_TROJAN_PASS = "";
-const DEFAULT_PROXY_IP = "www.visa.com.sg";
+const DEFAULT_PROXY_IP = "galaxytunne.cloud-ip.cc";
 const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
 const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query",
 "https://dns.google/dns-query",
@@ -98,8 +98,7 @@ function isValidUUID(uuid) {
 // Hybrid Proxy IP Pool (Local Fast Safe List)
 // ============================================
 const DEFAULT_LOCAL_PROXIES = [
-    "cdn-b100.xn--b6gac.eu.org",
-    "cdn.xn--b6gac.eu.org",
+    "galaxytunnel.cloud-ip.cc",
     "bpb.yousef.isegaro.com",
     "icook.hk",
     "icook.tw",

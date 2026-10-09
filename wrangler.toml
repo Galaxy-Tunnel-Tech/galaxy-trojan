@@ -7,12 +7,12 @@ keep_vars = true
 
 [vars]
 WS_PATH = "galaxy-tunnel"
-PROXYIP = "www.visa.com.sg"
+PROXYIP = "galaxytunnel.cloud-ip.cc"
 PROXY_LIST_URL = "https://galaxytunnel.github.io/PROXYIP.txt"
 DNS_RESOLVER_URL = ["https://cloudflare-dns.com/dns-query",
 "https://dns.google/dns-query",
 "https://dns.quad9.net/dns-query",
 "https://dns.adguard-dns.com/dns-query"]
 RATE_LIMIT_PER_MINUTE = "60"
-# TROJAN_PASSWORD = "your_secure_password"
-# UUID = "your-uuid"
+TROJAN_PASSWORD = "992b0e10-9ec5-4443-bfd7-58479be865c6"
+UUID = "992b0e10-9ec5-4443-bfd7-58479be865c6"

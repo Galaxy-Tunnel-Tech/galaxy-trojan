@@ -6,7 +6,7 @@ compatibility_flags = [ "nodejs_compat" ]
 [vars]
 WS_PATH = "galaxy-tunnel"
 PROXYIP = "galaxytunnel.cloud-ip.cc"
-PROXY_LIST_URL = "https://galaxytunnel.github.io/PROXYIP.txt"
+
 DNS_RESOLVER_URL = "https://cloudflare-dns.com/dns-query"
 TROJAN_PASSWORD = "992b0e10-9ec5-4443-bfd7-58479be865c6"
 UUID = "992b0e10-9ec5-4443-bfd7-58479be865c6"
